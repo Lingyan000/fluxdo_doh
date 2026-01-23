@@ -1,0 +1,72 @@
+[package]
+name = "doh_proxy"
+version = "0.1.0"
+edition = "2021"
+description = "DOH (DNS over HTTPS) proxy with ECH support for Flutter"
+
+[lib]
+# rlib for the binary, cdylib/staticlib for FFI
+crate-type = ["rlib", "cdylib", "staticlib"]
+name = "doh_proxy"
+
+[[bin]]
+name = "doh_proxy_bin"
+path = "src/main.rs"
+
+[[bin]]
+name = "gen_ca"
+path = "src/bin/gen_ca.rs"
+
+[features]
+default = []
+# Enable ECH support (requires cmake, NASM on Windows)
+ech = ["rustls/aws_lc_rs", "dep:aws-lc-rs"]
+
+[dependencies]
+# TLS with ECH support
+# Use ring by default (works everywhere), aws-lc-rs for ECH support
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+
+# Optional ECH crypto provider
+aws-lc-rs = { version = "1", optional = true }
+
+# Certificate generation for MITM
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+pem = "3"
+time = "0.3"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP proxy
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+
+# DNS with DOH and HTTPS record support
+hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "webpki-roots"] }
+
+# Utilities
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+parking_lot = "0.12"
+
+# Android logging
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
+panic = "abort"
