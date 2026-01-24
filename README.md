@@ -170,7 +170,7 @@ curl -x http://127.0.0.1:8080 https://example.com
 Flutter 中使用：
 
 ```dart
-import 'package:ldx/services/network/doh_proxy/doh_proxy.dart';
+import 'package:fluxdo/services/network/doh_proxy/doh_proxy.dart';
 
 // 启动代理
 final service = DohProxyService.instance;

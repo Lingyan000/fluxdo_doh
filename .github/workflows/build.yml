@@ -1,0 +1,114 @@
+name: Build DOH Proxy
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cmake and NASM for ECH support
+        run: choco install cmake nasm -y
+
+      - name: Build
+        run: cargo build --release --features ech
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: doh-proxy-windows
+          path: target/release/doh_proxy_bin.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cmake for ECH support
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Build
+        run: cargo build --release --features ech
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: doh-proxy-linux
+          path: target/release/doh_proxy_bin
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cmake for ECH support
+        run: brew install cmake
+
+      - name: Build
+        run: cargo build --release --features ech
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: doh-proxy-macos
+          path: target/release/doh_proxy_bin
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Android targets
+        run: |
+          rustup target add aarch64-linux-android
+          rustup target add armv7-linux-androideabi
+          rustup target add x86_64-linux-android
+          rustup target add i686-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Install cmake for ECH support
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Setup Android NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;25.2.9519653'
+
+      - name: Build for Android
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/25.2.9519653
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -t x86 --platform 28 build --release --features ech
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: doh-proxy-android
+          path: |
+            target/aarch64-linux-android/release/libdoh_proxy.so
+            target/armv7-linux-androideabi/release/libdoh_proxy.so
+            target/x86_64-linux-android/release/libdoh_proxy.so
+            target/i686-linux-android/release/libdoh_proxy.so
