@@ -558,6 +558,13 @@ impl DnsResolver {
     fn build_doh_client(timeout: Duration) -> Result<Client> {
         Client::builder()
             .timeout(timeout)
+            // Keep connections alive to reuse TLS/HTTP2 sessions.
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
+            .tcp_keepalive(Duration::from_secs(60))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
             .build()
             .map_err(|e| DohProxyError::Proxy(format!("Failed to build DoH client: {}", e)))
     }
