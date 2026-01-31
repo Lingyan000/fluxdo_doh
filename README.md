@@ -6,7 +6,7 @@
 
 - **DOH DNS 解析**：通过 HTTPS 加密 DNS 查询，防止 DNS 污染
 - **ECH 支持**：加密 TLS 握手中的 SNI 字段（需要服务器支持）
-- **多 DOH 服务器**：支持 Cloudflare、Google、Quad9、DNSPod、腾讯 DNS、阿里 DNS
+- **多 DOH 服务器**：支持 Cloudflare、Canadian Shield、Google、Quad9、DNSPod、腾讯 DNS、阿里 DNS
 - **跨平台**：支持 Windows、macOS、Linux、Android、iOS
 
 ## 项目结构
@@ -133,6 +133,7 @@ cargo build --release --target aarch64-apple-ios
 | 名称 | URL |
 |------|-----|
 | Cloudflare | `https://cloudflare-dns.com/dns-query` |
+| Canadian Shield | `https://private.canadianshield.cira.ca/dns-query` |
 | Google | `https://dns.google/dns-query` |
 | Quad9 | `https://dns.quad9.net/dns-query` |
 | DNSPod | `https://doh.pub/dns-query` |
