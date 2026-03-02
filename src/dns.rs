@@ -17,8 +17,6 @@ use tokio::net::lookup_host;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
-const MAX_HTTPS_ALIAS_DEPTH: usize = 4;
-
 /// DNS resolver with ECH config caching
 pub struct DnsResolver {
     resolver: TokioAsyncResolver,
@@ -27,8 +25,6 @@ pub struct DnsResolver {
     force_doh_get: bool,
     /// Cache for ECH configs (domain -> ECHConfigList)
     ech_cache: Arc<RwLock<HashMap<String, CachedEchConfig>>>,
-    /// Cache for resolved HTTPS/SVCB bindings
-    https_binding_cache: Arc<RwLock<HashMap<String, CachedHttpsBinding>>>,
     /// Cache for IP addresses
     ip_cache: Arc<RwLock<HashMap<String, CachedIpAddrs>>>,
     ech_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
@@ -43,11 +39,6 @@ struct CachedEchConfig {
     expires_at: std::time::Instant,
 }
 
-struct CachedHttpsBinding {
-    binding: Option<HttpsServiceBinding>,
-    expires_at: std::time::Instant,
-}
-
 struct CachedIpAddrs {
     addrs: Vec<IpAddr>,
     expires_at: std::time::Instant,
@@ -56,18 +47,6 @@ struct CachedIpAddrs {
 struct CachedIpRtt {
     rtt_ms: u128,
     expires_at: std::time::Instant,
-}
-
-#[derive(Clone)]
-struct HttpsServiceBinding {
-    effective_name: String,
-    ip_hints: Vec<IpAddr>,
-    ech_config: Option<EchConfigListBytes<'static>>,
-}
-
-enum HttpsResolution {
-    Alias(String),
-    Service(HttpsServiceBinding),
 }
 
 impl DnsResolver {
@@ -273,7 +252,6 @@ impl DnsResolver {
             doh_client: None,
             force_doh_get: false,
             ech_cache: Arc::new(RwLock::new(HashMap::new())),
-            https_binding_cache: Arc::new(RwLock::new(HashMap::new())),
             ip_cache: Arc::new(RwLock::new(HashMap::new())),
             ech_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -321,23 +299,52 @@ impl DnsResolver {
             return Ok(None);
         }
 
+        if self.force_doh_get {
+            let result = self.lookup_ech_config_via_doh_get(domain).await;
+            let mut inflight = self.ech_inflight.lock().await;
+            inflight.remove(domain);
+            notify.notify_waiters();
+            return result;
+        }
+
         let start = std::time::Instant::now();
-        let binding_result = if self.force_doh_get {
-            self.resolve_https_binding_via_doh_get_cached(domain).await
-        } else {
-            self.resolve_https_binding_via_lookup_cached(domain).await
+        // Query HTTPS record
+        let lookup = match tokio::time::timeout(
+            self.resolve_timeout,
+            self.resolver.lookup(
+                domain,
+                hickory_resolver::proto::rr::RecordType::HTTPS,
+            ),
+        )
+        .await
+        {
+            Ok(result) => match result {
+                Ok(lookup) => lookup,
+                Err(e) => {
+                    warn!(
+                        "ECH HTTPS lookup failed for {}, falling back to DoH GET: {}",
+                        domain, e
+                    );
+                    return self.lookup_ech_config_via_doh_get(domain).await;
+                }
+            },
+            Err(_) => {
+                warn!("ECH HTTPS lookup timed out for {}, skipping ECH", domain);
+                let result = self.lookup_ech_config_via_doh_get(domain).await;
+                let mut inflight = self.ech_inflight.lock().await;
+                inflight.remove(domain);
+                notify.notify_waiters();
+                return result;
+            }
         };
 
-        match binding_result {
-            Ok(Some(binding)) => {
-                if let Some(ech_config) = binding.ech_config {
-                    info!(
-                        "Found ECH config for {} via {} ({} bytes)",
-                        domain,
-                        binding.effective_name,
-                        ech_config.len()
-                    );
+        // Extract ECH config from SVCB/HTTPS records
+        for record in lookup.iter() {
+            if let Some(https) = record.as_https() {
+                if let Some(ech_config) = self.extract_ech_from_https(https) {
+                    info!("Found ECH config for {} ({} bytes)", domain, ech_config.len());
 
+                    // Cache the result
                     let cached = CachedEchConfig {
                         config: ech_config.clone(),
                         expires_at: std::time::Instant::now() + Duration::from_secs(600),
@@ -353,22 +360,6 @@ impl DnsResolver {
                     inflight.remove(domain);
                     notify.notify_waiters();
                     return Ok(Some(ech_config));
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                if self.force_doh_get {
-                    warn!("ECH HTTPS lookup failed for {}: {}", domain, e);
-                } else {
-                    warn!(
-                        "ECH HTTPS lookup failed for {}, falling back to DoH GET: {}",
-                        domain, e
-                    );
-                    let result = self.lookup_ech_config_via_doh_get(domain).await;
-                    let mut inflight = self.ech_inflight.lock().await;
-                    inflight.remove(domain);
-                    notify.notify_waiters();
-                    return result;
                 }
             }
         }
@@ -400,235 +391,6 @@ impl DnsResolver {
         }
 
         None
-    }
-
-    /// Extract address hints from HTTPS/SVCB record.
-    ///
-    /// `ipv4hint` / `ipv6hint` are only hints, so callers should still
-    /// fall back to A/AAAA lookups when they are absent.
-    fn extract_ip_hints_from_https(&self, https: &HTTPS) -> Vec<IpAddr> {
-        use hickory_resolver::proto::rr::rdata::svcb::SvcParamValue;
-
-        let mut addrs = Vec::new();
-
-        for (_, value) in https.svc_params().iter() {
-            match value {
-                SvcParamValue::Ipv4Hint(hints) => {
-                    for addr in hints.0.iter().copied() {
-                        let ip = IpAddr::V4(addr.0);
-                        if !addrs.contains(&ip) {
-                            addrs.push(ip);
-                        }
-                    }
-                }
-                SvcParamValue::Ipv6Hint(hints) => {
-                    for addr in hints.0.iter().copied() {
-                        let ip = IpAddr::V6(addr.0);
-                        if !addrs.contains(&ip) {
-                            addrs.push(ip);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        addrs
-    }
-
-    fn normalize_name(&self, name: &hickory_resolver::proto::rr::Name) -> String {
-        let ascii = name.to_ascii();
-        ascii.trim_end_matches('.').to_string()
-    }
-
-    fn resolve_https_rrset<'a, I>(&self, owner_domain: &str, records: I) -> Option<HttpsResolution>
-    where
-        I: IntoIterator<Item = &'a HTTPS>,
-    {
-        let mut alias_target: Option<String> = None;
-        let mut service_records: Vec<&HTTPS> = Vec::new();
-
-        for https in records {
-            if https.svc_priority() == 0 {
-                if !https.target_name().is_root() && alias_target.is_none() {
-                    alias_target = Some(self.normalize_name(https.target_name()));
-                }
-            } else {
-                service_records.push(https);
-            }
-        }
-
-        if let Some(target) = alias_target {
-            return Some(HttpsResolution::Alias(target));
-        }
-
-        let service = service_records
-            .into_iter()
-            .min_by_key(|https| https.svc_priority())?;
-
-        let effective_name = if service.target_name().is_root() {
-            owner_domain.to_string()
-        } else {
-            self.normalize_name(service.target_name())
-        };
-
-        Some(HttpsResolution::Service(HttpsServiceBinding {
-            effective_name,
-            ip_hints: self.extract_ip_hints_from_https(service),
-            ech_config: self.extract_ech_from_https(service),
-        }))
-    }
-
-    async fn resolve_https_binding_via_lookup(
-        &self,
-        domain: &str,
-    ) -> Result<Option<HttpsServiceBinding>> {
-        let mut current = domain.to_string();
-
-        for _ in 0..MAX_HTTPS_ALIAS_DEPTH {
-            let lookup = tokio::time::timeout(
-                self.resolve_timeout,
-                self.resolver
-                    .lookup(&current, hickory_resolver::proto::rr::RecordType::HTTPS),
-            )
-            .await
-            .map_err(|_| DohProxyError::Dns(format!("HTTPS lookup timed out for {}", current)))?
-            .map_err(|e| DohProxyError::Dns(format!("HTTPS lookup failed for {}: {}", current, e)))?;
-
-            let resolution = self.resolve_https_rrset(
-                &current,
-                lookup.iter().filter_map(|record| record.as_https()),
-            );
-
-            match resolution {
-                Some(HttpsResolution::Alias(next)) => {
-                    if next.is_empty() || next == current {
-                        warn!("Ignoring invalid HTTPS alias target for {}", current);
-                        return Ok(None);
-                    }
-                    debug!("Following HTTPS alias: {} -> {}", current, next);
-                    current = next;
-                }
-                Some(HttpsResolution::Service(binding)) => return Ok(Some(binding)),
-                None => return Ok(None),
-            }
-        }
-
-        warn!(
-            "HTTPS alias chain exceeded {} hops for {}",
-            MAX_HTTPS_ALIAS_DEPTH,
-            domain
-        );
-        Ok(None)
-    }
-
-    async fn resolve_https_binding_via_doh_get(
-        &self,
-        domain: &str,
-    ) -> Result<Option<HttpsServiceBinding>> {
-        let mut current = domain.to_string();
-
-        for _ in 0..MAX_HTTPS_ALIAS_DEPTH {
-            let Some(message) = self
-                .doh_get_message(&current, hickory_resolver::proto::rr::RecordType::HTTPS)
-                .await?
-            else {
-                return Ok(None);
-            };
-
-            let resolution = self.resolve_https_rrset(
-                &current,
-                message.answers().iter().filter_map(|record| match record.data() {
-                    Some(hickory_resolver::proto::rr::RData::HTTPS(https)) => Some(https),
-                    _ => None,
-                }),
-            );
-
-            match resolution {
-                Some(HttpsResolution::Alias(next)) => {
-                    if next.is_empty() || next == current {
-                        warn!("Ignoring invalid HTTPS alias target for {}", current);
-                        return Ok(None);
-                    }
-                    debug!("Following HTTPS alias via DoH GET: {} -> {}", current, next);
-                    current = next;
-                }
-                Some(HttpsResolution::Service(binding)) => return Ok(Some(binding)),
-                None => return Ok(None),
-            }
-        }
-
-        warn!(
-            "HTTPS alias chain exceeded {} hops for {}",
-            MAX_HTTPS_ALIAS_DEPTH,
-            domain
-        );
-        Ok(None)
-    }
-
-    fn get_cached_https_binding(&self, domain: &str) -> Option<Option<HttpsServiceBinding>> {
-        let cache = self.https_binding_cache.read();
-        cache.get(domain).and_then(|cached| {
-            if cached.expires_at > std::time::Instant::now() {
-                Some(cached.binding.clone())
-            } else {
-                None
-            }
-        })
-    }
-
-    fn cache_https_binding(&self, domain: &str, binding: Option<HttpsServiceBinding>) {
-        let cached = CachedHttpsBinding {
-            binding,
-            expires_at: std::time::Instant::now() + Duration::from_secs(600),
-        };
-        self.https_binding_cache
-            .write()
-            .insert(domain.to_string(), cached);
-    }
-
-    async fn resolve_https_binding_via_lookup_cached(
-        &self,
-        domain: &str,
-    ) -> Result<Option<HttpsServiceBinding>> {
-        if let Some(cached) = self.get_cached_https_binding(domain) {
-            debug!("HTTPS binding cache hit for {}", domain);
-            return Ok(cached);
-        }
-
-        let binding = self.resolve_https_binding_via_lookup(domain).await?;
-        self.cache_https_binding(domain, binding.clone());
-        Ok(binding)
-    }
-
-    async fn resolve_https_binding_via_doh_get_cached(
-        &self,
-        domain: &str,
-    ) -> Result<Option<HttpsServiceBinding>> {
-        if let Some(cached) = self.get_cached_https_binding(domain) {
-            debug!("HTTPS binding cache hit for {}", domain);
-            return Ok(cached);
-        }
-
-        let binding = self.resolve_https_binding_via_doh_get(domain).await?;
-        self.cache_https_binding(domain, binding.clone());
-        Ok(binding)
-    }
-
-    fn sort_ip_addrs_by_preference(&self, addrs: &mut Vec<IpAddr>) {
-        if self.prefer_ipv6 {
-            addrs.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });
-        } else {
-            addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
-        }
-    }
-
-    fn cache_ip_addrs(&self, domain: &str, addrs: &[IpAddr]) {
-        let cached = CachedIpAddrs {
-            addrs: addrs.to_vec(),
-            expires_at: std::time::Instant::now() + Duration::from_secs(600),
-        };
-        self.ip_cache.write().insert(domain.to_string(), cached);
     }
 
     fn ensure_ech_config_list_len_prefix(bytes: Vec<u8>) -> Vec<u8> {
@@ -700,45 +462,16 @@ impl DnsResolver {
             return result;
         }
 
-        let https_start = std::time::Instant::now();
-        let mut ip_domain = domain.to_string();
-        match self.resolve_https_binding_via_lookup_cached(domain).await {
-            Ok(Some(binding)) => {
-                ip_domain = binding.effective_name;
-                if !binding.ip_hints.is_empty() {
-                    let mut https_addrs = binding.ip_hints;
-                    self.sort_ip_addrs_by_preference(&mut https_addrs);
-                    self.cache_ip_addrs(domain, &https_addrs);
-                    debug!(
-                        "IP HTTPS hint lookup succeeded for {} in {} ms",
-                        domain,
-                        https_start.elapsed().as_millis()
-                    );
-                    let mut inflight = self.ip_inflight.lock().await;
-                    inflight.remove(domain);
-                    notify.notify_waiters();
-                    return Ok(https_addrs);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!(
-                    "IP HTTPS hint lookup failed for {}, falling back to A/AAAA: {}",
-                    domain, e
-                );
-            }
-        }
-
         let start = std::time::Instant::now();
         let lookup =
-            match tokio::time::timeout(self.resolve_timeout, self.resolver.lookup_ip(&ip_domain)).await
+            match tokio::time::timeout(self.resolve_timeout, self.resolver.lookup_ip(domain)).await
             {
                 Ok(result) => match result {
                     Ok(lookup) => lookup,
                     Err(e) => {
                         warn!(
-                            "IP lookup failed for {} (effective host {}), falling back to DoH GET: {}",
-                            domain, ip_domain, e
+                            "IP lookup failed for {}, falling back to DoH GET: {}",
+                            domain, e
                         );
                         let result = self.lookup_ip_via_doh_get(domain).await;
                         let mut inflight = self.ip_inflight.lock().await;
@@ -748,10 +481,7 @@ impl DnsResolver {
                     }
                 },
                 Err(_) => {
-                    warn!(
-                        "IP lookup timed out for {} (effective host {}), falling back to DoH GET",
-                        domain, ip_domain
-                    );
+                    warn!("IP lookup timed out for {}, falling back to DoH GET", domain);
                     let result = self.lookup_ip_via_doh_get(domain).await;
                     let mut inflight = self.ip_inflight.lock().await;
                     inflight.remove(domain);
@@ -761,13 +491,24 @@ impl DnsResolver {
             };
 
         let mut addrs: Vec<IpAddr> = lookup.iter().collect();
-        self.sort_ip_addrs_by_preference(&mut addrs);
-        self.cache_ip_addrs(domain, &addrs);
+
+        // Sort by preference
+        if self.prefer_ipv6 {
+            addrs.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });
+        } else {
+            addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+        }
+
+        // Cache the result
+        let cached = CachedIpAddrs {
+            addrs: addrs.clone(),
+            expires_at: std::time::Instant::now() + Duration::from_secs(600),
+        };
+        self.ip_cache.write().insert(domain.to_string(), cached);
 
         debug!(
-            "IP lookup succeeded for {} via {} in {} ms",
+            "IP lookup succeeded for {} in {} ms",
             domain,
-            ip_domain,
             start.elapsed().as_millis()
         );
         let mut inflight = self.ip_inflight.lock().await;
@@ -833,20 +574,28 @@ impl DnsResolver {
         domain: &str,
     ) -> Result<Option<EchConfigListBytes<'static>>> {
         let start = std::time::Instant::now();
-        if let Some(binding) = self.resolve_https_binding_via_doh_get_cached(domain).await? {
-            if let Some(ech_config) = binding.ech_config {
-                let cached = CachedEchConfig {
-                    config: ech_config.clone(),
-                    expires_at: std::time::Instant::now() + Duration::from_secs(600),
-                };
-                self.ech_cache.write().insert(domain.to_string(), cached);
-                debug!(
-                    "ECH DoH GET lookup succeeded for {} via {} in {} ms",
-                    domain,
-                    binding.effective_name,
-                    start.elapsed().as_millis()
-                );
-                return Ok(Some(ech_config));
+        let Some(message) = self
+            .doh_get_message(domain, hickory_resolver::proto::rr::RecordType::HTTPS)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        for record in message.answers() {
+            if let Some(hickory_resolver::proto::rr::RData::HTTPS(https)) = record.data() {
+                if let Some(ech_config) = self.extract_ech_from_https(https) {
+                    let cached = CachedEchConfig {
+                        config: ech_config.clone(),
+                        expires_at: std::time::Instant::now() + Duration::from_secs(600),
+                    };
+                    self.ech_cache.write().insert(domain.to_string(), cached);
+                    debug!(
+                        "ECH DoH GET lookup succeeded for {} in {} ms",
+                        domain,
+                        start.elapsed().as_millis()
+                    );
+                    return Ok(Some(ech_config));
+                }
             }
         }
 
@@ -855,28 +604,11 @@ impl DnsResolver {
 
     async fn lookup_ip_via_doh_get(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let start = std::time::Instant::now();
-        let mut ip_domain = domain.to_string();
-
-        if let Some(binding) = self.resolve_https_binding_via_doh_get_cached(domain).await? {
-            ip_domain = binding.effective_name;
-            if !binding.ip_hints.is_empty() {
-                let mut https_addrs = binding.ip_hints;
-                self.sort_ip_addrs_by_preference(&mut https_addrs);
-                self.cache_ip_addrs(domain, &https_addrs);
-                debug!(
-                    "IP HTTPS hint DoH GET lookup succeeded for {} in {} ms",
-                    domain,
-                    start.elapsed().as_millis()
-                );
-                return Ok(https_addrs);
-            }
-        }
-
         let mut addrs = Vec::new();
 
         let (a_result, aaaa_result) = tokio::join!(
-            self.doh_get_message(&ip_domain, hickory_resolver::proto::rr::RecordType::A),
-            self.doh_get_message(&ip_domain, hickory_resolver::proto::rr::RecordType::AAAA),
+            self.doh_get_message(domain, hickory_resolver::proto::rr::RecordType::A),
+            self.doh_get_message(domain, hickory_resolver::proto::rr::RecordType::AAAA),
         );
 
         if let Ok(Some(message)) = a_result {
@@ -899,13 +631,21 @@ impl DnsResolver {
             return Err(DohProxyError::Dns(format!("No IP found for {}", domain)));
         }
 
-        self.sort_ip_addrs_by_preference(&mut addrs);
-        self.cache_ip_addrs(domain, &addrs);
+        if self.prefer_ipv6 {
+            addrs.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });
+        } else {
+            addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
+        }
+
+        let cached = CachedIpAddrs {
+            addrs: addrs.clone(),
+            expires_at: std::time::Instant::now() + Duration::from_secs(600),
+        };
+        self.ip_cache.write().insert(domain.to_string(), cached);
 
         debug!(
-            "IP DoH GET lookup succeeded for {} via {} in {} ms",
+            "IP DoH GET lookup succeeded for {} in {} ms",
             domain,
-            ip_domain,
             start.elapsed().as_millis()
         );
         Ok(addrs)
