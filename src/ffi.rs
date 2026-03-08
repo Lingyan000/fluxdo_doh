@@ -61,6 +61,36 @@ pub extern "C" fn doh_proxy_start_with_server(
     start_server_with_config(config)
 }
 
+/// Start the DOH proxy server with a JSON configuration payload
+/// Returns the port number on success, or -1 on failure
+#[no_mangle]
+pub extern "C" fn doh_proxy_start_with_config_json(config_json: *const c_char) -> c_int {
+    doh_proxy_init_logging();
+
+    if config_json.is_null() {
+        tracing::error!("Config JSON pointer is null");
+        return -1;
+    }
+
+    let config_str = match unsafe { CStr::from_ptr(config_json) }.to_str() {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            tracing::error!("Invalid config JSON string");
+            return -1;
+        }
+    };
+
+    let config: ProxyConfig = match serde_json::from_str(config_str) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!("Failed to parse config JSON: {}", error);
+            return -1;
+        }
+    };
+
+    start_server_with_config(config)
+}
+
 /// Start the DOH proxy server (legacy API, uses Cloudflare DOH)
 /// Returns the port number on success, or -1 on failure
 #[no_mangle]

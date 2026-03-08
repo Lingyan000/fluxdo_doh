@@ -48,7 +48,8 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 bytes = "1"
 http = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "socks"] }
+shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher", "aead-cipher-2022"] }
 
 # DNS with DOH and HTTPS record support
 hickory-resolver = { version = "0.24", features = ["dns-over-https-rustls", "webpki-roots"] }
@@ -59,6 +60,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
 parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Android logging
 [target.'cfg(target_os = "android")'.dependencies]
