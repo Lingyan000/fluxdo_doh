@@ -1,6 +1,7 @@
 //! DNS resolver with DOH and HTTPS record support for ECH config retrieval
 
 use crate::error::{DohProxyError, Result};
+use crate::UpstreamProxyConfig;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hickory_resolver::{
@@ -62,12 +63,17 @@ impl DnsResolver {
     /// - `cloudflare` - Use Cloudflare DOH
     /// - `google` - Use Google DOH
     /// - `quad9` - Use Quad9 DOH
-    pub async fn new(doh_url: &str, prefer_ipv6: bool) -> Result<Self> {
+    pub async fn new(
+        doh_url: &str,
+        prefer_ipv6: bool,
+        upstream_proxy: Option<UpstreamProxyConfig>,
+    ) -> Result<Self> {
         let (config, doh_uri) = Self::parse_doh_url(doh_url, prefer_ipv6).await?;
         let mut resolver = Self::with_resolver_config(config, prefer_ipv6).await?;
         if let Some(uri) = doh_uri {
             resolver.doh_uri = Some(uri);
-            resolver.doh_client = Some(Self::build_doh_client(resolver.resolve_timeout)?);
+            resolver.doh_client =
+                Some(Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?);
             resolver.force_doh_get = true;
         }
         Ok(resolver)
@@ -555,9 +561,28 @@ impl DnsResolver {
         addrs
     }
 
-    fn build_doh_client(timeout: Duration) -> Result<Client> {
-        Client::builder()
-            .timeout(timeout)
+    fn build_doh_client(
+        timeout: Duration,
+        upstream_proxy: Option<&UpstreamProxyConfig>,
+    ) -> Result<Client> {
+        let mut builder = Client::builder().timeout(timeout);
+        if let Some(proxy) = upstream_proxy.filter(|proxy| {
+            proxy.is_valid() && (proxy.is_http() || proxy.is_socks5())
+        }) {
+            let mut reqwest_proxy = reqwest::Proxy::all(proxy.reqwest_proxy_url())
+                .map_err(|e| DohProxyError::Proxy(format!("Invalid upstream proxy URL: {}", e)))?;
+            if proxy.is_http() {
+                if let (Some(username), Some(password)) = (
+                proxy.username.as_deref().filter(|value| !value.trim().is_empty()),
+                proxy.password.as_deref().filter(|value| !value.trim().is_empty()),
+                ) {
+                    reqwest_proxy = reqwest_proxy.basic_auth(username, password);
+                }
+            }
+            builder = builder.proxy(reqwest_proxy);
+        }
+
+        builder
             // Keep connections alive to reuse TLS/HTTP2 sessions.
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(8)

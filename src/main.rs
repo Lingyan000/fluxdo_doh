@@ -1,6 +1,6 @@
 //! DOH Proxy - Standalone executable
 
-use doh_proxy::{DohProxyServer, ProxyConfig};
+use doh_proxy::{DohProxyServer, ProxyConfig, UpstreamProxyConfig};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -23,6 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(0);
 
     let prefer_ipv6 = args.iter().any(|a| a == "--ipv6");
+    let enable_doh = !args.iter().any(|a| a == "--no-doh");
 
     // Parse --doh <url> argument
     let doh_server = args
@@ -32,14 +33,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned()
         .unwrap_or_else(|| "cloudflare".to_string());
 
+    let upstream_host = args
+        .iter()
+        .position(|a| a == "--upstream-host")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let upstream_port = args
+        .iter()
+        .position(|a| a == "--upstream-port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u16>().ok());
+    let upstream_protocol = args
+        .iter()
+        .position(|a| a == "--upstream-protocol")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "http".to_string());
+    let upstream_username = args
+        .iter()
+        .position(|a| a == "--upstream-user")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let upstream_cipher = args
+        .iter()
+        .position(|a| a == "--upstream-cipher")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let upstream_password = args
+        .iter()
+        .position(|a| a == "--upstream-pass")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
+    let upstream_proxy = match (upstream_host, upstream_port) {
+        (Some(host), Some(port)) if !host.trim().is_empty() && port > 0 => Some(UpstreamProxyConfig {
+            protocol: upstream_protocol,
+            host,
+            port,
+            username: upstream_username,
+            password: upstream_password,
+            cipher: upstream_cipher,
+        }),
+        _ => None,
+    };
+
     let config = ProxyConfig {
         bind_port: port,
+        enable_doh,
         prefer_ipv6,
         doh_server,
+        upstream_proxy,
         ..Default::default()
     };
 
-    info!("Config: {:?}", config);
+    if let Some(proxy) = config.upstream_proxy.as_ref() {
+        info!(
+            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, upstream={}://{}:{}",
+            config.bind_port,
+            config.enable_doh,
+            config.prefer_ipv6,
+            config.doh_server,
+            proxy.protocol(),
+            proxy.host,
+            proxy.port
+        );
+    } else {
+        info!(
+            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, upstream=disabled",
+            config.bind_port, config.enable_doh, config.prefer_ipv6, config.doh_server
+        );
+    }
 
     // Create and start server
     let server = DohProxyServer::new(config).await?;
