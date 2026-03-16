@@ -25,6 +25,28 @@ fn get_server_holder() -> &'static Arc<RwLock<Option<Arc<DohProxyServer>>>> {
     SERVER.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
+fn parse_required_string(ptr: *const c_char, field_name: &str) -> std::result::Result<String, String> {
+    if ptr.is_null() {
+        return Err(format!("{} is null", field_name));
+    }
+
+    match unsafe { CStr::from_ptr(ptr) }.to_str() {
+        Ok(s) if !s.trim().is_empty() => Ok(s.to_string()),
+        _ => Err(format!("invalid {}", field_name)),
+    }
+}
+
+fn parse_optional_string(ptr: *const c_char) -> Option<String> {
+    if ptr.is_null() {
+        return None;
+    }
+
+    match unsafe { CStr::from_ptr(ptr) }.to_str() {
+        Ok(s) if !s.trim().is_empty() => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 /// Start the DOH proxy server with DOH server URL
 /// Returns the port number on success, or -1 on failure
 ///
@@ -203,31 +225,19 @@ pub extern "C" fn doh_proxy_lookup_ech_config(
     doh_server: *const c_char,
 ) -> *mut c_char {
     use base64::Engine;
-    use crate::dns::DnsResolver;
 
     doh_proxy_init_logging();
 
-    let host_str = if host.is_null() {
-        return error_json("host is null");
-    } else {
-        match unsafe { CStr::from_ptr(host) }.to_str() {
-            Ok(s) if !s.is_empty() => s.to_string(),
-            _ => return error_json("invalid host"),
-        }
+    let host_str = match parse_required_string(host, "host") {
+        Ok(value) => value,
+        Err(message) => return error_json(&message),
     };
-
-    let doh_url = if doh_server.is_null() {
-        "https://cloudflare-dns.com/dns-query".to_string()
-    } else {
-        match unsafe { CStr::from_ptr(doh_server) }.to_str() {
-            Ok(s) if !s.is_empty() => s.to_string(),
-            _ => "https://cloudflare-dns.com/dns-query".to_string(),
-        }
-    };
+    let doh_url = parse_optional_string(doh_server)
+        .unwrap_or_else(|| "https://cloudflare-dns.com/dns-query".to_string());
 
     let rt = get_runtime();
     let result = rt.block_on(async {
-        let resolver = DnsResolver::new(&doh_url, None, false, None).await?;
+        let resolver = crate::dns::DnsResolver::shared(&doh_url, Some(&doh_url), false, None).await?;
         resolver.lookup_ech_config(&host_str).await
     });
 
@@ -245,7 +255,231 @@ pub extern "C" fn doh_proxy_lookup_ech_config(
     }
 }
 
-/// Free a string returned by doh_proxy_lookup_ech_config
+/// Lookup IP addresses for a host via DOH A/AAAA records.
+/// Returns a pointer to a JSON string:
+/// {"ok":true,"data":["1.1.1.1","2606:4700:4700::1111"]} or {"ok":false,"error":"..."}
+/// The caller must free the returned string with doh_proxy_free_string.
+#[no_mangle]
+pub extern "C" fn doh_proxy_lookup_ip(
+    host: *const c_char,
+    doh_server: *const c_char,
+    prefer_ipv6: c_int,
+) -> *mut c_char {
+    doh_proxy_init_logging();
+
+    let host_str = match parse_required_string(host, "host") {
+        Ok(value) => value,
+        Err(message) => return error_json(&message),
+    };
+    let doh_url = parse_optional_string(doh_server)
+        .unwrap_or_else(|| "https://cloudflare-dns.com/dns-query".to_string());
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let resolver =
+            crate::dns::DnsResolver::shared(&doh_url, Some(&doh_url), prefer_ipv6 != 0, None)
+                .await?;
+        resolver.lookup_ip(&host_str).await
+    });
+
+    match result {
+        Ok(addrs) => {
+            let json = serde_json::json!({
+                "ok": true,
+                "data": addrs
+                    .into_iter()
+                    .map(|addr| addr.to_string())
+                    .collect::<Vec<_>>(),
+            })
+            .to_string();
+            match std::ffi::CString::new(json) {
+                Ok(c) => c.into_raw(),
+                Err(_) => error_json("CString conversion failed"),
+            }
+        }
+        Err(e) => error_json(&format!("{}", e)),
+    }
+}
+
+/// Lookup a host in one round-trip and return IPs, ECH config and TTL.
+/// Returns:
+/// {"ok":true,"ips":["1.1.1.1"],"ech":"<base64|null>","ttl_secs":300}
+#[no_mangle]
+pub extern "C" fn doh_proxy_lookup_host(
+    host: *const c_char,
+    doh_server: *const c_char,
+    doh_server_ech: *const c_char,
+    prefer_ipv6: c_int,
+    force_refresh: c_int,
+) -> *mut c_char {
+    use base64::Engine;
+
+    doh_proxy_init_logging();
+
+    let host_str = match parse_required_string(host, "host") {
+        Ok(value) => value,
+        Err(message) => return error_json(&message),
+    };
+    let doh_url = parse_optional_string(doh_server)
+        .unwrap_or_else(|| "https://cloudflare-dns.com/dns-query".to_string());
+    let doh_url_ech = parse_optional_string(doh_server_ech);
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
+        let resolver = crate::dns::DnsResolver::shared(
+            &doh_url,
+            Some(effective_doh_url_ech),
+            prefer_ipv6 != 0,
+            None,
+        )
+        .await?;
+        resolver.lookup_host(&host_str, force_refresh != 0).await
+    });
+
+    match result {
+        Ok(lookup) => {
+            let ech = lookup
+                .ech_config
+                .as_ref()
+                .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()));
+            let json = serde_json::json!({
+                "ok": true,
+                "ips": lookup
+                    .addrs
+                    .into_iter()
+                    .map(|addr| addr.to_string())
+                    .collect::<Vec<_>>(),
+                "ech": ech,
+                "preferred_ip": lookup.preferred_ip.map(|addr| addr.to_string()),
+                "ttl_secs": lookup.ttl.as_secs(),
+            })
+            .to_string();
+            match std::ffi::CString::new(json) {
+                Ok(c) => c.into_raw(),
+                Err(_) => error_json("CString conversion failed"),
+            }
+        }
+        Err(e) => error_json(&format!("{}", e)),
+    }
+}
+
+/// Record a successful host -> IP preference in the shared resolver.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn doh_proxy_record_host_success(
+    host: *const c_char,
+    doh_server: *const c_char,
+    doh_server_ech: *const c_char,
+    prefer_ipv6: c_int,
+    ip: *const c_char,
+) -> c_int {
+    doh_proxy_init_logging();
+
+    let host_str = match parse_required_string(host, "host") {
+        Ok(value) => value,
+        Err(message) => {
+            tracing::warn!("record_host_success: {}", message);
+            return 0;
+        }
+    };
+    let ip_str = match parse_required_string(ip, "ip") {
+        Ok(value) => value,
+        Err(message) => {
+            tracing::warn!("record_host_success: {}", message);
+            return 0;
+        }
+    };
+    let ip_addr = match ip_str.parse::<std::net::IpAddr>() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("record_host_success: invalid ip '{}': {}", ip_str, error);
+            return 0;
+        }
+    };
+
+    let doh_url = parse_optional_string(doh_server)
+        .unwrap_or_else(|| "https://cloudflare-dns.com/dns-query".to_string());
+    let doh_url_ech = parse_optional_string(doh_server_ech);
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
+        let resolver = crate::dns::DnsResolver::shared(
+            &doh_url,
+            Some(effective_doh_url_ech),
+            prefer_ipv6 != 0,
+            None,
+        )
+        .await?;
+        resolver.record_host_success(&host_str, ip_addr);
+        Ok::<(), crate::error::DohProxyError>(())
+    });
+
+    if let Err(error) = result {
+        tracing::warn!("record_host_success failed for {} -> {}: {}", host_str, ip_str, error);
+        0
+    } else {
+        1
+    }
+}
+
+/// Clear the shared preferred IP for a host.
+/// Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn doh_proxy_clear_preferred_host_ip(
+    host: *const c_char,
+    doh_server: *const c_char,
+    doh_server_ech: *const c_char,
+    prefer_ipv6: c_int,
+) -> c_int {
+    doh_proxy_init_logging();
+
+    let host_str = match parse_required_string(host, "host") {
+        Ok(value) => value,
+        Err(message) => {
+            tracing::warn!("clear_preferred_host_ip: {}", message);
+            return 0;
+        }
+    };
+    let doh_url = parse_optional_string(doh_server)
+        .unwrap_or_else(|| "https://cloudflare-dns.com/dns-query".to_string());
+    let doh_url_ech = parse_optional_string(doh_server_ech);
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let effective_doh_url_ech = doh_url_ech.as_deref().unwrap_or(doh_url.as_str());
+        let resolver = crate::dns::DnsResolver::shared(
+            &doh_url,
+            Some(effective_doh_url_ech),
+            prefer_ipv6 != 0,
+            None,
+        )
+        .await?;
+        resolver.clear_preferred_host_ip(&host_str);
+        Ok::<(), crate::error::DohProxyError>(())
+    });
+
+    if let Err(error) = result {
+        tracing::warn!("clear_preferred_host_ip failed for {}: {}", host_str, error);
+        0
+    } else {
+        1
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn doh_proxy_clear_dns_cache() -> c_int {
+    doh_proxy_init_logging();
+
+    let rt = get_runtime();
+    rt.block_on(async {
+        crate::dns::DnsResolver::clear_shared_caches().await;
+    });
+    1
+}
+
+/// Free a string returned by doh_proxy_lookup_ech_config / doh_proxy_lookup_ip / doh_proxy_lookup_host
 #[no_mangle]
 pub extern "C" fn doh_proxy_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {

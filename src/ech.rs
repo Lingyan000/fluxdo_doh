@@ -8,9 +8,8 @@ use crate::error::{DohProxyError, Result};
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tracing::{debug, info, warn};
 
@@ -25,16 +24,10 @@ pub struct DohTlsConnector {
     timeout: Duration,
     upstream_proxy: Option<UpstreamProxyConfig>,
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
-    host_ip_cache: Arc<Mutex<HashMap<String, CachedHostIp>>>,
     /// 用户指定的服务端 IP，跳过 DNS 解析
     server_ip: Option<std::net::IpAddr>,
     /// TLS ClientConfig 缓存，复用以启用 TLS 会话恢复
-    tls_config_cache: Arc<Mutex<HashMap<String, Arc<ClientConfig>>>>,
-}
-
-struct CachedHostIp {
-    addr: std::net::IpAddr,
-    expires_at: std::time::Instant,
+    tls_config_cache: Arc<tokio::sync::Mutex<std::collections::HashMap<String, Arc<ClientConfig>>>>,
 }
 
 impl DohTlsConnector {
@@ -68,9 +61,8 @@ impl DohTlsConnector {
             timeout,
             upstream_proxy,
             crypto_provider,
-            host_ip_cache: Arc::new(Mutex::new(HashMap::new())),
             server_ip: parsed_ip,
-            tls_config_cache: Arc::new(Mutex::new(HashMap::new())),
+            tls_config_cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -170,11 +162,11 @@ impl DohTlsConnector {
             return Ok(tls_stream);
         }
 
-        // 2. Prefer recently successful IP for this host (avoid frequent IP switching)
-        if let Some(cached_addr) = self.get_cached_host_ip(host).await {
+        // 2. Prefer recently successful IP for this host (shared with query mode)
+        if let Some(cached_addr) = dns_resolver.preferred_host_ip(host) {
             let socket_addr = SocketAddr::new(cached_addr, port);
             debug!(
-                "Trying cached IP for {}:{} via {}",
+                "Trying sticky IP for {}:{} via {}",
                 host, port, socket_addr
             );
             match self
@@ -182,6 +174,7 @@ impl DohTlsConnector {
                 .await
             {
                 Ok(stream) => {
+                    dns_resolver.record_host_success(host, socket_addr.ip());
                     dns_resolver
                         .record_ip_rtt(socket_addr.ip(), start.elapsed());
                     #[cfg(feature = "ech")]
@@ -207,10 +200,10 @@ impl DohTlsConnector {
                 }
                 Err(e) => {
                     warn!(
-                        "Cached IP failed for {}:{} via {}: {}",
+                        "Sticky IP failed for {}:{} via {}: {}",
                         host, port, socket_addr, e
                     );
-                    self.clear_cached_host_ip(host).await;
+                    dns_resolver.clear_preferred_host_ip(host);
                 }
             }
         }
@@ -291,7 +284,7 @@ impl DohTlsConnector {
 
         match result {
             Ok((stream, socket_addr, rtt)) => {
-                self.set_cached_host_ip(host, socket_addr.ip()).await;
+                dns_resolver.record_host_success(host, socket_addr.ip());
                 dns_resolver.record_ip_rtt(socket_addr.ip(), rtt);
                 #[cfg(feature = "ech")]
                 {
@@ -562,37 +555,6 @@ impl DohTlsConnector {
         Err(last_error.unwrap_or_else(|| {
             DohProxyError::Proxy(format!("Failed to connect to {}:{}", host, port))
         }))
-    }
-
-    async fn get_cached_host_ip(&self, host: &str) -> Option<std::net::IpAddr> {
-        let now = std::time::Instant::now();
-        let cache = self.host_ip_cache.lock().await;
-        cache
-            .get(host)
-            .filter(|entry| entry.expires_at > now)
-            .map(|entry| entry.addr)
-    }
-
-    async fn set_cached_host_ip(&self, host: &str, addr: std::net::IpAddr) {
-        let now = std::time::Instant::now();
-        let mut cache = self.host_ip_cache.lock().await;
-        if let Some(entry) = cache.get(host) {
-            if entry.expires_at > now {
-                return;
-            }
-        }
-        cache.insert(
-            host.to_string(),
-            CachedHostIp {
-                addr,
-                expires_at: now + Duration::from_secs(600),
-            },
-        );
-    }
-
-    async fn clear_cached_host_ip(&self, host: &str) {
-        let mut cache = self.host_ip_cache.lock().await;
-        cache.remove(host);
     }
 
     async fn finish_tls(

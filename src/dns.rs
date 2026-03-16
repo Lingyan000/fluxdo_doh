@@ -14,9 +14,14 @@ use parking_lot::RwLock;
 use reqwest::Client;
 use rustls::pki_types::EchConfigListBytes;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tokio::net::lookup_host;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, RwLock as AsyncRwLock};
 use tracing::{debug, info, warn};
 
 /// 缓存条目上限
@@ -29,6 +34,11 @@ const MAX_TTL_SECS: u64 = 1800;
 const DEFAULT_TTL_SECS: u64 = 300;
 /// 每隔多少次查询清理一次过期缓存
 const CLEANUP_INTERVAL: u64 = 100;
+/// 成功连通后的 host -> ip 粘性缓存时长
+const STICKY_IP_TTL_SECS: u64 = 600;
+
+static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
+    OnceLock::new();
 
 /// DNS resolver with ECH config caching
 pub struct DnsResolver {
@@ -48,10 +58,18 @@ pub struct DnsResolver {
     ech_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     ip_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     ip_rtt_cache: Arc<RwLock<HashMap<IpAddr, CachedIpRtt>>>,
+    preferred_host_ip_cache: Arc<RwLock<HashMap<String, CachedPreferredHostIp>>>,
     prefer_ipv6: bool,
     resolve_timeout: Duration,
     /// 查询计数器，用于定期清理缓存
     query_count: AtomicU64,
+}
+
+pub struct LookupHostResult {
+    pub addrs: Vec<IpAddr>,
+    pub ech_config: Option<EchConfigListBytes<'static>>,
+    pub preferred_ip: Option<IpAddr>,
+    pub ttl: Duration,
 }
 
 struct CachedEchConfig {
@@ -69,6 +87,11 @@ struct CachedIpRtt {
     expires_at: std::time::Instant,
 }
 
+struct CachedPreferredHostIp {
+    addr: IpAddr,
+    expires_at: std::time::Instant,
+}
+
 /// HTTPS 记录中提取的 hint 信息
 #[derive(Default)]
 pub struct HttpsHints {
@@ -78,6 +101,73 @@ pub struct HttpsHints {
 }
 
 impl DnsResolver {
+    fn shared_cache_key(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+        upstream_proxy: Option<&UpstreamProxyConfig>,
+    ) -> String {
+        let upstream_key = upstream_proxy
+            .map(UpstreamProxyConfig::cache_key)
+            .unwrap_or_default();
+        format!(
+            "{}|{}|{}|{}",
+            doh_url,
+            doh_url_ech.unwrap_or(""),
+            if prefer_ipv6 { "v6" } else { "v4" },
+            upstream_key,
+        )
+    }
+
+    fn shared_resolver_holder() -> &'static Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>> {
+        SHARED_RESOLVERS.get_or_init(|| Arc::new(AsyncRwLock::new(HashMap::new())))
+    }
+
+    pub async fn shared(
+        doh_url: &str,
+        doh_url_ech: Option<&str>,
+        prefer_ipv6: bool,
+        upstream_proxy: Option<UpstreamProxyConfig>,
+    ) -> Result<Arc<Self>> {
+        let normalized_doh_url_ech = doh_url_ech.filter(|value| *value != doh_url);
+        let cache_key = Self::shared_cache_key(
+            doh_url,
+            normalized_doh_url_ech,
+            prefer_ipv6,
+            upstream_proxy.as_ref(),
+        );
+
+        {
+            let guard = Self::shared_resolver_holder().read().await;
+            if let Some(resolver) = guard.get(&cache_key) {
+                return Ok(resolver.clone());
+            }
+        }
+
+        let resolver = Arc::new(
+            Self::new(
+                doh_url,
+                normalized_doh_url_ech,
+                prefer_ipv6,
+                upstream_proxy.clone(),
+            )
+            .await?,
+        );
+
+        let mut guard = Self::shared_resolver_holder().write().await;
+        Ok(guard
+            .entry(cache_key)
+            .or_insert_with(|| resolver.clone())
+            .clone())
+    }
+
+    pub async fn clear_shared_caches() {
+        let guard = Self::shared_resolver_holder().read().await;
+        for resolver in guard.values() {
+            resolver.clear_all_caches();
+        }
+    }
+
     /// Create a new DNS resolver using Cloudflare DOH
     pub async fn new_cloudflare(prefer_ipv6: bool) -> Result<Self> {
         Self::with_resolver_config(ResolverConfig::cloudflare_https(), prefer_ipv6).await
@@ -315,6 +405,7 @@ impl DnsResolver {
             ech_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_rtt_cache: Arc::new(RwLock::new(HashMap::new())),
+            preferred_host_ip_cache: Arc::new(RwLock::new(HashMap::new())),
             prefer_ipv6,
             resolve_timeout,
             query_count: AtomicU64::new(0),
@@ -634,6 +725,42 @@ impl DnsResolver {
         (ech_config, ip_result)
     }
 
+    pub async fn lookup_host(&self, domain: &str, force_refresh: bool) -> Result<LookupHostResult> {
+        if force_refresh {
+            self.clear_host_cache(domain);
+        }
+
+        let (ech_config, ip_result) = self.lookup_ech_and_ip(domain).await;
+        let addrs = match ip_result {
+            Ok(addrs) => self.order_addrs_by_rtt(addrs),
+            Err(error) => {
+                if ech_config.is_none() {
+                    return Err(error);
+                }
+                warn!(
+                    "IP lookup failed for {}, keeping ECH-only result: {}",
+                    domain, error
+                );
+                Vec::new()
+            }
+        };
+        // 只返回已经“实际连通验证过”的 sticky IP。
+        // 冷启动时不要把排序后的首个地址直接提升为 preferred_ip，
+        // 否则 query 模式会把一个未验证的单 IP 提前钉死给 rhttp，
+        // 一旦这个边缘节点不稳定，就会持续触发连接重置/超时。
+        let preferred_ip = self.preferred_host_ip_for_addrs(domain, &addrs);
+        let ttl = self
+            .remaining_ttl_for_host(domain)
+            .unwrap_or_else(|| Duration::from_secs(DEFAULT_TTL_SECS));
+
+        Ok(LookupHostResult {
+            addrs,
+            ech_config,
+            preferred_ip,
+            ttl,
+        })
+    }
+
     /// Set IPv6 preference
     pub fn set_prefer_ipv6(&mut self, prefer: bool) {
         self.prefer_ipv6 = prefer;
@@ -643,6 +770,70 @@ impl DnsResolver {
 
     pub fn prefer_ipv6(&self) -> bool {
         self.prefer_ipv6
+    }
+
+    pub fn clear_host_cache(&self, domain: &str) {
+        self.ip_cache.write().remove(domain);
+        self.ech_cache.write().remove(domain);
+        self.preferred_host_ip_cache.write().remove(domain);
+    }
+
+    pub fn clear_all_caches(&self) {
+        self.ip_cache.write().clear();
+        self.ech_cache.write().clear();
+        self.ip_rtt_cache.write().clear();
+        self.preferred_host_ip_cache.write().clear();
+    }
+
+    pub fn preferred_host_ip(&self, domain: &str) -> Option<IpAddr> {
+        let now = std::time::Instant::now();
+        self.preferred_host_ip_cache
+            .read()
+            .get(domain)
+            .filter(|entry| entry.expires_at > now)
+            .map(|entry| entry.addr)
+    }
+
+    pub fn preferred_host_ip_for_addrs(&self, domain: &str, addrs: &[IpAddr]) -> Option<IpAddr> {
+        let preferred = self.preferred_host_ip(domain)?;
+        if addrs.iter().any(|addr| *addr == preferred) {
+            Some(preferred)
+        } else {
+            self.clear_preferred_host_ip(domain);
+            None
+        }
+    }
+
+    pub fn record_host_success(&self, domain: &str, addr: IpAddr) {
+        self.preferred_host_ip_cache.write().insert(
+            domain.to_string(),
+            CachedPreferredHostIp {
+                addr,
+                expires_at: std::time::Instant::now() + Duration::from_secs(STICKY_IP_TTL_SECS),
+            },
+        );
+    }
+
+    pub fn record_host_preference(&self, domain: &str, addr: IpAddr, ttl: Duration) {
+        let ttl = if ttl > Duration::from_secs(STICKY_IP_TTL_SECS) {
+            Duration::from_secs(STICKY_IP_TTL_SECS)
+        } else if ttl < Duration::from_secs(MIN_TTL_SECS) {
+            Duration::from_secs(MIN_TTL_SECS)
+        } else {
+            ttl
+        };
+
+        self.preferred_host_ip_cache.write().insert(
+            domain.to_string(),
+            CachedPreferredHostIp {
+                addr,
+                expires_at: std::time::Instant::now() + ttl,
+            },
+        );
+    }
+
+    pub fn clear_preferred_host_ip(&self, domain: &str) {
+        self.preferred_host_ip_cache.write().remove(domain);
     }
 
     pub fn record_ip_rtt(&self, addr: IpAddr, rtt: Duration) {
@@ -741,6 +932,30 @@ impl DnsResolver {
         self.ip_cache.write().retain(|_, v| v.expires_at > now);
         self.ech_cache.write().retain(|_, v| v.expires_at > now);
         self.ip_rtt_cache.write().retain(|_, v| v.expires_at > now);
+        self.preferred_host_ip_cache
+            .write()
+            .retain(|_, v| v.expires_at > now);
+    }
+
+    fn remaining_ttl_for_host(&self, domain: &str) -> Option<Duration> {
+        let now = std::time::Instant::now();
+        let ip_ttl = self
+            .ip_cache
+            .read()
+            .get(domain)
+            .and_then(|entry| entry.expires_at.checked_duration_since(now));
+        let ech_ttl = self
+            .ech_cache
+            .read()
+            .get(domain)
+            .and_then(|entry| entry.expires_at.checked_duration_since(now));
+
+        match (ip_ttl, ech_ttl) {
+            (Some(ip), Some(ech)) => Some(ip.min(ech)),
+            (Some(ip), None) => Some(ip),
+            (None, Some(ech)) => Some(ech),
+            (None, None) => None,
+        }
     }
 
     /// 将 TTL 秒数限制在合理范围内
