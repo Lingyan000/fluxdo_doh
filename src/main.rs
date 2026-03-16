@@ -65,6 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|i| args.get(i + 1))
         .cloned();
 
+    // Parse --doh-server-ech <url> argument
+    let doh_server_ech = args
+        .iter()
+        .position(|a| a == "--doh-server-ech")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     // Parse --server-ip <ip> argument
     let server_ip = args
         .iter()
@@ -89,19 +96,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enable_doh,
         prefer_ipv6,
         doh_server,
+        doh_server_ech,
         upstream_proxy,
         server_ip,
         ..Default::default()
     };
 
     let server_ip_str = config.server_ip.as_deref().unwrap_or("auto");
+    let doh_ech_str = config.doh_server_ech.as_deref().unwrap_or("(same as dns)");
     if let Some(proxy) = config.upstream_proxy.as_ref() {
         info!(
-            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, server_ip={}, upstream={}://{}:{}",
+            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, doh_server_ech={}, server_ip={}, upstream={}://{}:{}",
             config.bind_port,
             config.enable_doh,
             config.prefer_ipv6,
             config.doh_server,
+            doh_ech_str,
             server_ip_str,
             proxy.protocol(),
             proxy.host,
@@ -109,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         info!(
-            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, server_ip={}, upstream=disabled",
-            config.bind_port, config.enable_doh, config.prefer_ipv6, config.doh_server, server_ip_str
+            "Config: bind_port={}, enable_doh={}, prefer_ipv6={}, doh_server={}, doh_server_ech={}, server_ip={}, upstream=disabled",
+            config.bind_port, config.enable_doh, config.prefer_ipv6, config.doh_server, doh_ech_str, server_ip_str
         );
     }
 
