@@ -194,6 +194,75 @@ pub extern "C" fn doh_proxy_get_port() -> c_int {
     PORT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Lookup ECH config for a host via DOH DNS HTTPS record.
+/// Returns a pointer to a JSON string: {"ok":true,"data":"<base64>"} or {"ok":false,"error":"..."}
+/// The caller must free the returned string with doh_proxy_free_string.
+#[no_mangle]
+pub extern "C" fn doh_proxy_lookup_ech_config(
+    host: *const c_char,
+    doh_server: *const c_char,
+) -> *mut c_char {
+    use base64::Engine;
+    use crate::dns::DnsResolver;
+
+    doh_proxy_init_logging();
+
+    let host_str = if host.is_null() {
+        return error_json("host is null");
+    } else {
+        match unsafe { CStr::from_ptr(host) }.to_str() {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            _ => return error_json("invalid host"),
+        }
+    };
+
+    let doh_url = if doh_server.is_null() {
+        "https://cloudflare-dns.com/dns-query".to_string()
+    } else {
+        match unsafe { CStr::from_ptr(doh_server) }.to_str() {
+            Ok(s) if !s.is_empty() => s.to_string(),
+            _ => "https://cloudflare-dns.com/dns-query".to_string(),
+        }
+    };
+
+    let rt = get_runtime();
+    let result = rt.block_on(async {
+        let resolver = DnsResolver::new(&doh_url, None, false, None).await?;
+        resolver.lookup_ech_config(&host_str).await
+    });
+
+    match result {
+        Ok(Some(ech_bytes)) => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(ech_bytes.as_ref());
+            let json = format!(r#"{{"ok":true,"data":"{}"}}"#, b64);
+            match std::ffi::CString::new(json) {
+                Ok(c) => c.into_raw(),
+                Err(_) => error_json("CString conversion failed"),
+            }
+        }
+        Ok(None) => error_json("no ECH config found"),
+        Err(e) => error_json(&format!("{}", e)),
+    }
+}
+
+/// Free a string returned by doh_proxy_lookup_ech_config
+#[no_mangle]
+pub extern "C" fn doh_proxy_free_string(ptr: *mut c_char) {
+    if !ptr.is_null() {
+        unsafe {
+            let _ = std::ffi::CString::from_raw(ptr);
+        }
+    }
+}
+
+fn error_json(msg: &str) -> *mut c_char {
+    let json = format!(r#"{{"ok":false,"error":"{}"}}"#, msg.replace('"', r#"\""#));
+    match std::ffi::CString::new(json) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Initialize logging (call once at startup)
 #[no_mangle]
 pub extern "C" fn doh_proxy_init_logging() {
