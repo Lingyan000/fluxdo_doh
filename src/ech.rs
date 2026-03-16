@@ -26,6 +26,10 @@ pub struct DohTlsConnector {
     upstream_proxy: Option<UpstreamProxyConfig>,
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
     host_ip_cache: Arc<Mutex<HashMap<String, CachedHostIp>>>,
+    /// 用户指定的服务端 IP，跳过 DNS 解析
+    server_ip: Option<std::net::IpAddr>,
+    /// TLS ClientConfig 缓存，复用以启用 TLS 会话恢复
+    tls_config_cache: Arc<Mutex<HashMap<String, Arc<ClientConfig>>>>,
 }
 
 struct CachedHostIp {
@@ -40,11 +44,22 @@ impl DohTlsConnector {
         enable_doh: bool,
         timeout: Duration,
         upstream_proxy: Option<UpstreamProxyConfig>,
+        server_ip: Option<String>,
     ) -> Self {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
+
+        let parsed_ip = server_ip
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|s| {
+                s.parse::<std::net::IpAddr>().ok().or_else(|| {
+                    warn!("Invalid server_ip '{}', ignoring", s);
+                    None
+                })
+            });
 
         Self {
             dns_resolver,
@@ -54,6 +69,8 @@ impl DohTlsConnector {
             upstream_proxy,
             crypto_provider,
             host_ip_cache: Arc::new(Mutex::new(HashMap::new())),
+            server_ip: parsed_ip,
+            tls_config_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -82,10 +99,10 @@ impl DohTlsConnector {
 
         if !self.enable_doh {
             info!("DoH disabled for {}, using upstream/direct tunnel only", host);
-            let tls_config = self.build_tls_config(
+            let tls_config = self.get_or_build_tls_config(
                 #[cfg(feature = "ech")]
                 None,
-            )?;
+            ).await?;
             let connector = TlsConnector::from(tls_config);
             let tcp_stream = self.connect_tcp(host, port).await?;
             let tls_stream = self
@@ -100,26 +117,25 @@ impl DohTlsConnector {
             return Ok(tls_stream);
         }
 
-        // 1. Lookup ECH config from DNS HTTPS records (best-effort)
-        #[cfg(feature = "ech")]
-        let ech_config = match self
+        let dns_resolver = self
             .dns_resolver
             .as_ref()
-            .ok_or_else(|| DohProxyError::Dns("DoH resolver is not initialized".to_string()))?
-            .lookup_ech_config(host)
-            .await
-        {
-            Ok(config) => config,
-            Err(e) => {
-                warn!(
-                    "ECH lookup failed for {}, proceeding without ECH: {}",
-                    host, e
-                );
-                None
-            }
+            .ok_or_else(|| DohProxyError::Dns("DoH resolver is not initialized".to_string()))?;
+
+        // 1. 并行查询 ECH 配置和 IP 地址
+        let (ech_config, ip_result) = if self.server_ip.is_some() {
+            // server_ip 已指定，只需查 ECH 配置
+            let ech_result = match dns_resolver.lookup_ech_config(host).await {
+                Ok(config) => config,
+                Err(e) => {
+                    warn!("ECH lookup failed for {}, proceeding without ECH: {}", host, e);
+                    None
+                }
+            };
+            (ech_result, Ok(vec![self.server_ip.unwrap()]))
+        } else {
+            dns_resolver.lookup_ech_and_ip(host).await
         };
-        #[cfg(not(feature = "ech"))]
-        let ech_config: Option<rustls::pki_types::EchConfigListBytes<'static>> = None;
 
         #[cfg(feature = "ech")]
         if ech_config.is_some() {
@@ -129,15 +145,15 @@ impl DohTlsConnector {
         }
 
         #[cfg(not(feature = "ech"))]
-        if ech_config.is_some() {
-            info!("ECH config found for {} but ECH feature not enabled", host);
+        {
+            let _ = &ech_config;
         }
 
-        // Build TLS config (with or without ECH)
-        let tls_config = self.build_tls_config(
+        // Build TLS config (with or without ECH), 使用缓存以启用 TLS 会话恢复
+        let tls_config = self.get_or_build_tls_config(
             #[cfg(feature = "ech")]
             ech_config.as_ref(),
-        )?;
+        ).await?;
         let connector = TlsConnector::from(tls_config);
 
         if self.upstream_proxy.as_ref().filter(|proxy| proxy.is_valid()).is_some() {
@@ -153,11 +169,6 @@ impl DohTlsConnector {
             );
             return Ok(tls_stream);
         }
-
-        let dns_resolver = self
-            .dns_resolver
-            .as_ref()
-            .ok_or_else(|| DohProxyError::Dns("DoH resolver is not initialized".to_string()))?;
 
         // 2. Prefer recently successful IP for this host (avoid frequent IP switching)
         if let Some(cached_addr) = self.get_cached_host_ip(host).await {
@@ -204,8 +215,8 @@ impl DohTlsConnector {
             }
         }
 
-        // 3. Lookup IP address using DOH
-        let addrs = dns_resolver.lookup_ip(host).await?;
+        // 3. 使用 IP 列表连接
+        let addrs = ip_result?;
         if addrs.is_empty() {
             return Err(DohProxyError::Dns(format!("No IP found for {}", host)));
         }
@@ -220,6 +231,7 @@ impl DohTlsConnector {
             (v4_addrs, v6_addrs)
         };
 
+        // Happy Eyeballs: 主协议族先行，50ms 后启动备用协议族
         let result = if secondary.is_empty() {
             self.connect_to_addrs(&connector, server_name.clone(), host, port, primary)
                 .await
@@ -233,7 +245,7 @@ impl DohTlsConnector {
             ));
 
             let mut secondary_fut = Box::pin(async {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 self.connect_to_addrs(&connector, server_name.clone(), host, port, secondary)
                     .await
             });
@@ -359,7 +371,60 @@ impl DohTlsConnector {
         Ok(Arc::new(config))
     }
 
-    /// Try to establish a TLS connection
+    /// 获取或构建 TLS 配置（带缓存，复用以启用 TLS 会话恢复）
+    #[cfg(feature = "ech")]
+    async fn get_or_build_tls_config(
+        &self,
+        ech_config_bytes: Option<&rustls::pki_types::EchConfigListBytes<'static>>,
+    ) -> Result<Arc<ClientConfig>> {
+        let cache_key = match ech_config_bytes {
+            Some(bytes) => format!("ech:{:?}", bytes.as_ref()),
+            None => "no_ech".to_string(),
+        };
+
+        {
+            let cache = self.tls_config_cache.lock().await;
+            if let Some(config) = cache.get(&cache_key) {
+                return Ok(config.clone());
+            }
+        }
+
+        let config = self.build_tls_config(ech_config_bytes)?;
+
+        let mut cache = self.tls_config_cache.lock().await;
+        cache.insert(cache_key, config.clone());
+        // 限制缓存大小
+        if cache.len() > 32 {
+            let keys: Vec<String> = cache.keys().cloned().collect();
+            if let Some(key) = keys.first() {
+                cache.remove(key);
+            }
+        }
+
+        Ok(config)
+    }
+
+    /// 获取或构建 TLS 配置（无 ECH 支持版本）
+    #[cfg(not(feature = "ech"))]
+    async fn get_or_build_tls_config(&self) -> Result<Arc<ClientConfig>> {
+        let cache_key = "no_ech".to_string();
+
+        {
+            let cache = self.tls_config_cache.lock().await;
+            if let Some(config) = cache.get(&cache_key) {
+                return Ok(config.clone());
+            }
+        }
+
+        let config = self.build_tls_config()?;
+
+        let mut cache = self.tls_config_cache.lock().await;
+        cache.insert(cache_key, config.clone());
+
+        Ok(config)
+    }
+
+    /// Try to establish a TLS connection with separate TCP/TLS timeouts
     async fn try_connect(
         &self,
         connector: &TlsConnector,
@@ -367,22 +432,31 @@ impl DohTlsConnector {
         tunnel_host: &str,
         server_name: ServerName<'static>,
     ) -> Result<TlsStream<BoxStream>> {
-        // TCP connect with timeout
-        let tcp_stream = tokio::time::timeout(self.timeout, TcpStream::connect(addr))
+        // TCP 连接阶段：5s 超时
+        let tcp_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(addr),
+        )
             .await
             .map_err(|_| DohProxyError::Timeout)?
             .map_err(DohProxyError::Io)?;
 
-        self.finish_tls(
-            connector,
-            server_name,
-            Box::new(tcp_stream),
-            tunnel_host,
-            addr.port(),
+        // TLS 握手阶段：10s 超时
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            self.finish_tls(
+                connector,
+                server_name,
+                Box::new(tcp_stream),
+                tunnel_host,
+                addr.port(),
+            ),
         )
             .await
+            .map_err(|_| DohProxyError::Timeout)?
     }
 
+    /// 交错并行连接多个地址，每个地址间 250ms 延迟启动，先成功者胜出
     async fn connect_to_addrs(
         &self,
         connector: &TlsConnector,
@@ -391,22 +465,96 @@ impl DohTlsConnector {
         port: u16,
         addrs: Vec<std::net::IpAddr>,
     ) -> Result<(TlsStream<BoxStream>, SocketAddr, Duration)> {
-        let mut last_error = None;
-        for addr in addrs {
-            let socket_addr = SocketAddr::new(addr, port);
+        if addrs.is_empty() {
+            return Err(DohProxyError::Proxy(format!("No addresses for {}:{}", host, port)));
+        }
+
+        // 只有一个地址时直接连接
+        if addrs.len() == 1 {
+            let socket_addr = SocketAddr::new(addrs[0], port);
             debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
             let attempt_start = std::time::Instant::now();
-            match self
-                .try_connect(connector, socket_addr, host, server_name.clone())
-                .await
-            {
-                Ok(stream) => {
-                    let rtt = attempt_start.elapsed();
+            let stream = self.try_connect(connector, socket_addr, host, server_name).await?;
+            return Ok((stream, socket_addr, attempt_start.elapsed()));
+        }
+
+        // 多地址交错并行：每个地址延迟 250ms 启动
+        use tokio::sync::mpsc;
+        let (tx, mut rx) = mpsc::channel(1);
+        let attempt_start = std::time::Instant::now();
+
+        for (i, addr) in addrs.iter().enumerate() {
+            let socket_addr = SocketAddr::new(*addr, port);
+            let connector = connector.clone();
+            let server_name = server_name.clone();
+            let host = host.to_string();
+            let tx = tx.clone();
+
+            tokio::spawn(async move {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(250 * i as u64)).await;
+                }
+                debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
+                let start = std::time::Instant::now();
+                // TCP 连接：5s 超时
+                let tcp_result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    TcpStream::connect(socket_addr),
+                ).await;
+                let tcp_stream = match tcp_result {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        warn!("TCP connect failed to {}: {}", socket_addr, e);
+                        let _ = tx.send(Err(DohProxyError::Io(e))).await;
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("TCP connect timed out to {}", socket_addr);
+                        let _ = tx.send(Err(DohProxyError::Timeout)).await;
+                        return;
+                    }
+                };
+                // TLS 握手：10s 超时
+                let tls_result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    connector.connect(server_name, Box::new(tcp_stream) as BoxStream),
+                ).await;
+                match tls_result {
+                    Ok(Ok(stream)) => {
+                        let rtt = start.elapsed();
+                        let _ = tx.send(Ok((stream, socket_addr, rtt))).await;
+                    }
+                    Ok(Err(e)) => {
+                        warn!("TLS handshake failed to {}: {}", socket_addr, e);
+                        let _ = tx.send(Err(DohProxyError::Io(e))).await;
+                    }
+                    Err(_) => {
+                        warn!("TLS handshake timed out to {}", socket_addr);
+                        let _ = tx.send(Err(DohProxyError::Timeout)).await;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut last_error = None;
+        let total = addrs.len();
+        let mut received = 0;
+        while let Some(result) = rx.recv().await {
+            received += 1;
+            match result {
+                Ok((stream, socket_addr, rtt)) => {
+                    debug!(
+                        "Connected to {}:{} via {} in {} ms",
+                        host, port, socket_addr, attempt_start.elapsed().as_millis()
+                    );
                     return Ok((stream, socket_addr, rtt));
                 }
                 Err(e) => {
-                    warn!("Failed to connect to {}: {}", socket_addr, e);
                     last_error = Some(e);
+                    if received >= total {
+                        break;
+                    }
                 }
             }
         }
