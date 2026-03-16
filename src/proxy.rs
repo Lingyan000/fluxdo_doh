@@ -50,15 +50,15 @@ impl DohProxyServer {
         }
 
         let dns_resolver = if config.enable_doh {
-            Some(Arc::new(
-                DnsResolver::new(
+            Some(
+                DnsResolver::shared(
                     &config.doh_server,
                     config.doh_server_ech.as_deref(),
                     config.prefer_ipv6,
                     config.upstream_proxy.clone(),
                 )
                 .await?,
-            ))
+            )
         } else {
             None
         };

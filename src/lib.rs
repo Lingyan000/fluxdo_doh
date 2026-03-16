@@ -105,6 +105,21 @@ impl UpstreamProxyConfig {
             "ss" | "shadowsocks"
         )
     }
+
+    pub fn cache_key(&self) -> String {
+        let username = self.username.as_deref().map(str::trim).unwrap_or_default();
+        let password = self.password.as_deref().map(str::trim).unwrap_or_default();
+        let cipher = self.cipher.as_deref().map(str::trim).unwrap_or_default();
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.protocol().to_ascii_lowercase(),
+            self.host.trim().to_ascii_lowercase(),
+            self.port,
+            username,
+            password,
+            cipher,
+        )
+    }
 }
 
 /// Proxy configuration
