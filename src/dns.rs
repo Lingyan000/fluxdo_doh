@@ -13,10 +13,22 @@ use http::Uri;
 use parking_lot::RwLock;
 use reqwest::Client;
 use rustls::pki_types::EchConfigListBytes;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, net::IpAddr, sync::Arc, time::Duration};
 use tokio::net::lookup_host;
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
+
+/// 缓存条目上限
+const MAX_CACHE_SIZE: usize = 1000;
+/// TTL 下限（秒）
+const MIN_TTL_SECS: u64 = 60;
+/// TTL 上限（秒）
+const MAX_TTL_SECS: u64 = 1800;
+/// 默认 TTL（秒），无法获取时使用
+const DEFAULT_TTL_SECS: u64 = 300;
+/// 每隔多少次查询清理一次过期缓存
+const CLEANUP_INTERVAL: u64 = 100;
 
 /// DNS resolver with ECH config caching
 pub struct DnsResolver {
@@ -33,6 +45,8 @@ pub struct DnsResolver {
     ip_rtt_cache: Arc<RwLock<HashMap<IpAddr, CachedIpRtt>>>,
     prefer_ipv6: bool,
     resolve_timeout: Duration,
+    /// 查询计数器，用于定期清理缓存
+    query_count: AtomicU64,
 }
 
 struct CachedEchConfig {
@@ -48,6 +62,14 @@ struct CachedIpAddrs {
 struct CachedIpRtt {
     rtt_ms: u128,
     expires_at: std::time::Instant,
+}
+
+/// HTTPS 记录中提取的 hint 信息
+#[derive(Default)]
+pub struct HttpsHints {
+    pub ech_config: Option<EchConfigListBytes<'static>>,
+    pub ipv4_hints: Vec<IpAddr>,
+    pub ipv6_hints: Vec<IpAddr>,
 }
 
 impl DnsResolver {
@@ -264,11 +286,15 @@ impl DnsResolver {
             ip_rtt_cache: Arc::new(RwLock::new(HashMap::new())),
             prefer_ipv6,
             resolve_timeout,
+            query_count: AtomicU64::new(0),
         })
     }
 
     /// Lookup ECH config for a domain via HTTPS DNS record
     pub async fn lookup_ech_config(&self, domain: &str) -> Result<Option<EchConfigListBytes<'static>>> {
+        // 定期清理过期缓存
+        self.maybe_cleanup_caches();
+
         // Check cache first
         {
             let cache = self.ech_cache.read();
@@ -344,23 +370,27 @@ impl DnsResolver {
             }
         };
 
+        // 从 lookup 中提取 TTL
+        let ttl_duration = lookup
+            .valid_until()
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or(Duration::from_secs(DEFAULT_TTL_SECS));
+        let ttl_secs = ttl_duration.as_secs().clamp(MIN_TTL_SECS, MAX_TTL_SECS);
+
         // Extract ECH config from SVCB/HTTPS records
         for record in lookup.iter() {
             if let Some(https) = record.as_https() {
                 if let Some(ech_config) = self.extract_ech_from_https(https) {
                     info!("Found ECH config for {} ({} bytes)", domain, ech_config.len());
 
-                    // Cache the result
-                    let cached = CachedEchConfig {
-                        config: ech_config.clone(),
-                        expires_at: std::time::Instant::now() + Duration::from_secs(600),
-                    };
-                    self.ech_cache.write().insert(domain.to_string(), cached);
+                    // Cache with DNS TTL
+                    self.put_ech_cache(domain, ech_config.clone(), Duration::from_secs(ttl_secs));
 
                     debug!(
-                        "ECH HTTPS lookup succeeded for {} in {} ms",
+                        "ECH HTTPS lookup succeeded for {} in {} ms (TTL: {}s)",
                         domain,
-                        start.elapsed().as_millis()
+                        start.elapsed().as_millis(),
+                        ttl_secs,
                     );
                     let mut inflight = self.ech_inflight.lock().await;
                     inflight.remove(domain);
@@ -378,25 +408,40 @@ impl DnsResolver {
         result
     }
 
-    /// Extract ECH config from HTTPS/SVCB record
-    fn extract_ech_from_https(&self, https: &HTTPS) -> Option<EchConfigListBytes<'static>> {
+    /// 从 HTTPS/SVCB 记录中提取 ECH 配置和 IP hint
+    fn extract_hints_from_https(&self, https: &HTTPS) -> HttpsHints {
         use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
 
-        // HTTPS record contains SVCB parameters
-        // ECH config is in the "ech" parameter (key = 5)
+        let mut hints = HttpsHints::default();
+
         for (key, value) in https.svc_params().iter() {
-            // Check if this is the ECH parameter (key 5)
-            if let SvcParamKey::EchConfig = key {
-                // Extract ECH config bytes from the value
-                if let SvcParamValue::EchConfig(ech_config) = value {
-                    // EchConfig contains the raw bytes in its inner field
-                    let bytes = Self::ensure_ech_config_list_len_prefix(ech_config.0.clone());
-                    return Some(EchConfigListBytes::from(bytes));
+            match key {
+                SvcParamKey::EchConfig => {
+                    if let SvcParamValue::EchConfig(ech_config) = value {
+                        let bytes = Self::ensure_ech_config_list_len_prefix(ech_config.0.clone());
+                        hints.ech_config = Some(EchConfigListBytes::from(bytes));
+                    }
                 }
+                SvcParamKey::Ipv4Hint => {
+                    if let SvcParamValue::Ipv4Hint(ipv4_hint) = value {
+                        hints.ipv4_hints.extend(ipv4_hint.0.iter().map(|ip| IpAddr::V4(**ip)));
+                    }
+                }
+                SvcParamKey::Ipv6Hint => {
+                    if let SvcParamValue::Ipv6Hint(ipv6_hint) = value {
+                        hints.ipv6_hints.extend(ipv6_hint.0.iter().map(|ip| IpAddr::V6(**ip)));
+                    }
+                }
+                _ => {}
             }
         }
 
-        None
+        hints
+    }
+
+    /// 兼容旧接口：仅提取 ECH 配置
+    fn extract_ech_from_https(&self, https: &HTTPS) -> Option<EchConfigListBytes<'static>> {
+        self.extract_hints_from_https(https).ech_config
     }
 
     fn ensure_ech_config_list_len_prefix(bytes: Vec<u8>) -> Vec<u8> {
@@ -424,6 +469,9 @@ impl DnsResolver {
 
     /// Lookup IP addresses for a domain
     pub async fn lookup_ip(&self, domain: &str) -> Result<Vec<IpAddr>> {
+        // 定期清理过期缓存
+        self.maybe_cleanup_caches();
+
         // Check cache first
         {
             let cache = self.ip_cache.read();
@@ -498,6 +546,13 @@ impl DnsResolver {
 
         let mut addrs: Vec<IpAddr> = lookup.iter().collect();
 
+        // 从 lookup 中提取 TTL（valid_until 与当前时间的差）
+        let ttl_duration = lookup
+            .valid_until()
+            .checked_duration_since(std::time::Instant::now())
+            .unwrap_or(Duration::from_secs(DEFAULT_TTL_SECS));
+        let ttl_secs = ttl_duration.as_secs().clamp(MIN_TTL_SECS, MAX_TTL_SECS);
+
         // Sort by preference
         if self.prefer_ipv6 {
             addrs.sort_by_key(|a| if a.is_ipv6() { 0 } else { 1 });
@@ -505,22 +560,47 @@ impl DnsResolver {
             addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
         }
 
-        // Cache the result
-        let cached = CachedIpAddrs {
-            addrs: addrs.clone(),
-            expires_at: std::time::Instant::now() + Duration::from_secs(600),
-        };
-        self.ip_cache.write().insert(domain.to_string(), cached);
+        // Cache the result with DNS TTL
+        self.put_ip_cache(domain, addrs.clone(), Duration::from_secs(ttl_secs));
 
         debug!(
-            "IP lookup succeeded for {} in {} ms",
+            "IP lookup succeeded for {} in {} ms (TTL: {}s)",
             domain,
-            start.elapsed().as_millis()
+            start.elapsed().as_millis(),
+            ttl_secs,
         );
         let mut inflight = self.ip_inflight.lock().await;
         inflight.remove(domain);
         notify.notify_waiters();
         Ok(addrs)
+    }
+
+    /// 并行查询 ECH 配置和 IP 地址
+    /// 如果 HTTPS 记录中包含 ipv4hint/ipv6hint，将 hint IP 合并到结果前面
+    pub async fn lookup_ech_and_ip(
+        &self,
+        domain: &str,
+    ) -> (Option<EchConfigListBytes<'static>>, Result<Vec<IpAddr>>) {
+        let (ech_result, ip_result) = tokio::join!(
+            self.lookup_ech_config(domain),
+            self.lookup_ip(domain),
+        );
+
+        let ech_config = match ech_result {
+            Ok(config) => config,
+            Err(e) => {
+                warn!("ECH lookup failed for {}: {}", domain, e);
+                None
+            }
+        };
+
+        // 尝试从 HTTPS 记录中获取 IP hint 并合并
+        let ip_result = match ip_result {
+            Ok(addrs) => Ok(addrs),
+            Err(e) => Err(e),
+        };
+
+        (ech_config, ip_result)
     }
 
     /// Set IPv6 preference
@@ -559,6 +639,83 @@ impl DnsResolver {
             (rtt, family_bias)
         });
         addrs
+    }
+
+    /// 写入 IP 缓存，超过上限时淘汰过期条目
+    fn put_ip_cache(&self, domain: &str, addrs: Vec<IpAddr>, ttl: Duration) {
+        let mut cache = self.ip_cache.write();
+        cache.insert(
+            domain.to_string(),
+            CachedIpAddrs {
+                addrs,
+                expires_at: std::time::Instant::now() + ttl,
+            },
+        );
+        if cache.len() > MAX_CACHE_SIZE {
+            Self::evict_expired(&mut cache);
+        }
+    }
+
+    /// 写入 ECH 缓存，超过上限时淘汰过期条目
+    fn put_ech_cache(&self, domain: &str, config: EchConfigListBytes<'static>, ttl: Duration) {
+        let mut cache = self.ech_cache.write();
+        cache.insert(
+            domain.to_string(),
+            CachedEchConfig {
+                config,
+                expires_at: std::time::Instant::now() + ttl,
+            },
+        );
+        if cache.len() > MAX_CACHE_SIZE {
+            Self::evict_expired_ech(&mut cache);
+        }
+    }
+
+    /// 淘汰过期 IP 缓存条目
+    fn evict_expired(cache: &mut HashMap<String, CachedIpAddrs>) {
+        let now = std::time::Instant::now();
+        cache.retain(|_, v| v.expires_at > now);
+        // 仍然超限，淘汰最早过期的条目
+        if cache.len() > MAX_CACHE_SIZE {
+            let remove_count = cache.len() - MAX_CACHE_SIZE + MAX_CACHE_SIZE / 10;
+            let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.expires_at)).collect();
+            entries.sort_by_key(|(_, exp)| *exp);
+            for (key, _) in entries.into_iter().take(remove_count) {
+                cache.remove(&key);
+            }
+        }
+    }
+
+    /// 淘汰过期 ECH 缓存条目
+    fn evict_expired_ech(cache: &mut HashMap<String, CachedEchConfig>) {
+        let now = std::time::Instant::now();
+        cache.retain(|_, v| v.expires_at > now);
+        if cache.len() > MAX_CACHE_SIZE {
+            let remove_count = cache.len() - MAX_CACHE_SIZE + MAX_CACHE_SIZE / 10;
+            let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.expires_at)).collect();
+            entries.sort_by_key(|(_, exp)| *exp);
+            for (key, _) in entries.into_iter().take(remove_count) {
+                cache.remove(&key);
+            }
+        }
+    }
+
+    /// 定期清理所有过期缓存
+    fn maybe_cleanup_caches(&self) {
+        let count = self.query_count.fetch_add(1, Ordering::Relaxed);
+        if count % CLEANUP_INTERVAL != 0 {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.ip_cache.write().retain(|_, v| v.expires_at > now);
+        self.ech_cache.write().retain(|_, v| v.expires_at > now);
+        self.ip_rtt_cache.write().retain(|_, v| v.expires_at > now);
+    }
+
+    /// 将 TTL 秒数限制在合理范围内
+    fn clamp_ttl(ttl_secs: u32) -> Duration {
+        let clamped = (ttl_secs as u64).clamp(MIN_TTL_SECS, MAX_TTL_SECS);
+        Duration::from_secs(clamped)
     }
 
     fn build_doh_client(
@@ -609,15 +766,13 @@ impl DnsResolver {
         for record in message.answers() {
             if let Some(hickory_resolver::proto::rr::RData::HTTPS(https)) = record.data() {
                 if let Some(ech_config) = self.extract_ech_from_https(https) {
-                    let cached = CachedEchConfig {
-                        config: ech_config.clone(),
-                        expires_at: std::time::Instant::now() + Duration::from_secs(600),
-                    };
-                    self.ech_cache.write().insert(domain.to_string(), cached);
+                    let ttl = Self::clamp_ttl(record.ttl());
+                    self.put_ech_cache(domain, ech_config.clone(), ttl);
                     debug!(
-                        "ECH DoH GET lookup succeeded for {} in {} ms",
+                        "ECH DoH GET lookup succeeded for {} in {} ms (TTL: {}s)",
                         domain,
-                        start.elapsed().as_millis()
+                        start.elapsed().as_millis(),
+                        ttl.as_secs(),
                     );
                     return Ok(Some(ech_config));
                 }
@@ -630,6 +785,7 @@ impl DnsResolver {
     async fn lookup_ip_via_doh_get(&self, domain: &str) -> Result<Vec<IpAddr>> {
         let start = std::time::Instant::now();
         let mut addrs = Vec::new();
+        let mut min_ttl = MAX_TTL_SECS as u32;
 
         let (a_result, aaaa_result) = tokio::join!(
             self.doh_get_message(domain, hickory_resolver::proto::rr::RecordType::A),
@@ -640,6 +796,7 @@ impl DnsResolver {
             for record in message.answers() {
                 if let Some(hickory_resolver::proto::rr::RData::A(a)) = record.data() {
                     addrs.push(IpAddr::V4(a.0));
+                    min_ttl = min_ttl.min(record.ttl());
                 }
             }
         }
@@ -648,6 +805,7 @@ impl DnsResolver {
             for record in message.answers() {
                 if let Some(hickory_resolver::proto::rr::RData::AAAA(aaaa)) = record.data() {
                     addrs.push(IpAddr::V6(aaaa.0));
+                    min_ttl = min_ttl.min(record.ttl());
                 }
             }
         }
@@ -662,16 +820,14 @@ impl DnsResolver {
             addrs.sort_by_key(|a| if a.is_ipv4() { 0 } else { 1 });
         }
 
-        let cached = CachedIpAddrs {
-            addrs: addrs.clone(),
-            expires_at: std::time::Instant::now() + Duration::from_secs(600),
-        };
-        self.ip_cache.write().insert(domain.to_string(), cached);
+        let ttl = Self::clamp_ttl(min_ttl);
+        self.put_ip_cache(domain, addrs.clone(), ttl);
 
         debug!(
-            "IP DoH GET lookup succeeded for {} in {} ms",
+            "IP DoH GET lookup succeeded for {} in {} ms (TTL: {}s)",
             domain,
-            start.elapsed().as_millis()
+            start.elapsed().as_millis(),
+            ttl.as_secs(),
         );
         Ok(addrs)
     }

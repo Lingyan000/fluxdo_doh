@@ -62,6 +62,7 @@ impl DohProxyServer {
             config.enable_doh,
             Duration::from_secs(config.timeout_secs),
             config.upstream_proxy.clone(),
+            config.server_ip.clone(),
         ));
 
         let cert_manager = if config.enable_doh {

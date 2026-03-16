@@ -126,6 +126,9 @@ pub struct ProxyConfig {
     /// Optional upstream proxy configuration
     #[serde(default)]
     pub upstream_proxy: Option<UpstreamProxyConfig>,
+    /// Optional server IP address to connect directly, skipping DNS resolution
+    #[serde(default)]
+    pub server_ip: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -138,6 +141,7 @@ impl Default for ProxyConfig {
             prefer_ipv6: false,
             timeout_secs: 30,
             upstream_proxy: None,
+            server_ip: None,
         }
     }
 }
