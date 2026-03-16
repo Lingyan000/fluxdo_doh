@@ -117,8 +117,12 @@ pub struct ProxyConfig {
     /// Whether local gateway should use DoH/ECH MITM mode
     #[serde(default = "default_enable_doh")]
     pub enable_doh: bool,
-    /// DOH server URL for DNS queries
+    /// DOH server URL for DNS queries (A/AAAA records)
     pub doh_server: String,
+    /// Optional separate DOH server URL for ECH config (HTTPS records)
+    /// When None, uses the same server as doh_server
+    #[serde(default)]
+    pub doh_server_ech: Option<String>,
     /// Whether to prefer IPv6
     pub prefer_ipv6: bool,
     /// Connection timeout in seconds
@@ -138,6 +142,7 @@ impl Default for ProxyConfig {
             bind_port: 0,
             enable_doh: true,
             doh_server: "https://cloudflare-dns.com/dns-query".to_string(),
+            doh_server_ech: None,
             prefer_ipv6: false,
             timeout_secs: 30,
             upstream_proxy: None,

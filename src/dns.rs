@@ -33,9 +33,14 @@ const CLEANUP_INTERVAL: u64 = 100;
 /// DNS resolver with ECH config caching
 pub struct DnsResolver {
     resolver: TokioAsyncResolver,
-    doh_uri: Option<Uri>,
-    doh_client: Option<Client>,
-    force_doh_get: bool,
+    // IP 解析用（A/AAAA 查询）
+    doh_uri_ip: Option<Uri>,
+    doh_client_ip: Option<Client>,
+    force_doh_get_ip: bool,
+    // ECH 配置用（HTTPS 记录查询）
+    doh_uri_ech: Option<Uri>,
+    doh_client_ech: Option<Client>,
+    force_doh_get_ech: bool,
     /// Cache for ECH configs (domain -> ECHConfigList)
     ech_cache: Arc<RwLock<HashMap<String, CachedEchConfig>>>,
     /// Cache for IP addresses
@@ -85,18 +90,41 @@ impl DnsResolver {
     /// - `cloudflare` - Use Cloudflare DOH
     /// - `google` - Use Google DOH
     /// - `quad9` - Use Quad9 DOH
+    ///
+    /// `doh_url_ech` specifies a separate DOH server for ECH config (HTTPS records).
+    /// When None, ECH queries use the same server as DNS queries.
     pub async fn new(
         doh_url: &str,
+        doh_url_ech: Option<&str>,
         prefer_ipv6: bool,
         upstream_proxy: Option<UpstreamProxyConfig>,
     ) -> Result<Self> {
-        let (config, doh_uri) = Self::parse_doh_url(doh_url, prefer_ipv6).await?;
+        let (config, doh_uri_ip) = Self::parse_doh_url(doh_url, prefer_ipv6).await?;
         let mut resolver = Self::with_resolver_config(config, prefer_ipv6).await?;
-        if let Some(uri) = doh_uri {
-            resolver.doh_uri = Some(uri);
-            resolver.doh_client =
-                Some(Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?);
-            resolver.force_doh_get = true;
+        if let Some(uri) = doh_uri_ip {
+            let client = Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?;
+            resolver.doh_uri_ip = Some(uri.clone());
+            resolver.doh_client_ip = Some(client);
+            resolver.force_doh_get_ip = true;
+
+            // ECH 客户端：如果指定了独立 URL 则解析，否则复用 IP 客户端配置
+            if let Some(ech_url) = doh_url_ech {
+                let (_, doh_uri_ech) = Self::parse_doh_url(ech_url, prefer_ipv6).await?;
+                if let Some(ech_uri) = doh_uri_ech {
+                    let ech_client = Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?;
+                    resolver.doh_uri_ech = Some(ech_uri);
+                    resolver.doh_client_ech = Some(ech_client);
+                } else {
+                    // ECH URL 解析未产生 URI（不应发生），回退复用
+                    resolver.doh_uri_ech = Some(uri.clone());
+                    resolver.doh_client_ech = resolver.doh_client_ip.clone();
+                }
+            } else {
+                // 未指定独立 ECH 服务器，复用 IP 客户端
+                resolver.doh_uri_ech = Some(uri);
+                resolver.doh_client_ech = resolver.doh_client_ip.clone();
+            }
+            resolver.force_doh_get_ech = true;
         }
         Ok(resolver)
     }
@@ -276,9 +304,12 @@ impl DnsResolver {
 
         Ok(Self {
             resolver,
-            doh_uri: None,
-            doh_client: None,
-            force_doh_get: false,
+            doh_uri_ip: None,
+            doh_client_ip: None,
+            force_doh_get_ip: false,
+            doh_uri_ech: None,
+            doh_client_ech: None,
+            force_doh_get_ech: false,
             ech_cache: Arc::new(RwLock::new(HashMap::new())),
             ip_cache: Arc::new(RwLock::new(HashMap::new())),
             ech_inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -331,7 +362,7 @@ impl DnsResolver {
             return Ok(None);
         }
 
-        if self.force_doh_get {
+        if self.force_doh_get_ech {
             let result = self.lookup_ech_config_via_doh_get(domain).await;
             let mut inflight = self.ech_inflight.lock().await;
             inflight.remove(domain);
@@ -508,7 +539,7 @@ impl DnsResolver {
             return Err(DohProxyError::Dns(format!("No IP found for {}", domain)));
         }
 
-        if self.force_doh_get {
+        if self.force_doh_get_ip {
             let result = self.lookup_ip_via_doh_get(domain).await;
             let mut inflight = self.ip_inflight.lock().await;
             inflight.remove(domain);
@@ -757,7 +788,12 @@ impl DnsResolver {
     ) -> Result<Option<EchConfigListBytes<'static>>> {
         let start = std::time::Instant::now();
         let Some(message) = self
-            .doh_get_message(domain, hickory_resolver::proto::rr::RecordType::HTTPS)
+            .doh_get_message_with(
+                self.doh_client_ech.as_ref(),
+                self.doh_uri_ech.as_ref(),
+                domain,
+                hickory_resolver::proto::rr::RecordType::HTTPS,
+            )
             .await?
         else {
             return Ok(None);
@@ -788,8 +824,18 @@ impl DnsResolver {
         let mut min_ttl = MAX_TTL_SECS as u32;
 
         let (a_result, aaaa_result) = tokio::join!(
-            self.doh_get_message(domain, hickory_resolver::proto::rr::RecordType::A),
-            self.doh_get_message(domain, hickory_resolver::proto::rr::RecordType::AAAA),
+            self.doh_get_message_with(
+                self.doh_client_ip.as_ref(),
+                self.doh_uri_ip.as_ref(),
+                domain,
+                hickory_resolver::proto::rr::RecordType::A,
+            ),
+            self.doh_get_message_with(
+                self.doh_client_ip.as_ref(),
+                self.doh_uri_ip.as_ref(),
+                domain,
+                hickory_resolver::proto::rr::RecordType::AAAA,
+            ),
         );
 
         if let Ok(Some(message)) = a_result {
@@ -832,15 +878,17 @@ impl DnsResolver {
         Ok(addrs)
     }
 
-    async fn doh_get_message(
+    async fn doh_get_message_with(
         &self,
+        client: Option<&Client>,
+        uri: Option<&Uri>,
         domain: &str,
         record_type: hickory_resolver::proto::rr::RecordType,
     ) -> Result<Option<hickory_resolver::proto::op::Message>> {
-        let Some(client) = self.doh_client.as_ref() else {
+        let Some(client) = client else {
             return Ok(None);
         };
-        let Some(uri) = self.doh_uri.as_ref() else {
+        let Some(uri) = uri else {
             return Ok(None);
         };
         let start = std::time::Instant::now();
