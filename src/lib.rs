@@ -133,6 +133,10 @@ pub struct ProxyConfig {
     /// Optional server IP address to connect directly, skipping DNS resolution
     #[serde(default)]
     pub server_ip: Option<String>,
+    /// Gateway (reverse proxy) mode: accept plain HTTP, forward via TLS+ECH
+    /// Eliminates double TLS overhead compared to MITM mode
+    #[serde(default)]
+    pub gateway_mode: bool,
 }
 
 impl Default for ProxyConfig {
@@ -147,6 +151,7 @@ impl Default for ProxyConfig {
             timeout_secs: 30,
             upstream_proxy: None,
             server_ip: None,
+            gateway_mode: false,
         }
     }
 }

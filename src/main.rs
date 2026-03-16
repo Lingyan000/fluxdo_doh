@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let prefer_ipv6 = args.iter().any(|a| a == "--ipv6");
     let enable_doh = !args.iter().any(|a| a == "--no-doh");
+    let gateway_mode = args.iter().any(|a| a == "--gateway");
 
     // Parse --doh <url> argument
     let doh_server = args
@@ -94,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ProxyConfig {
         bind_port: port,
         enable_doh,
+        gateway_mode,
         prefer_ipv6,
         doh_server,
         doh_server_ech,
