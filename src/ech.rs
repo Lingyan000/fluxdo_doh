@@ -85,6 +85,24 @@ impl DohTlsConnector {
     /// Connect to a server using ECH if available
     /// Returns a TLS stream that can be used for bidirectional I/O
     pub async fn connect(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
+        self.connect_inner(host, port, false).await
+    }
+
+    /// Connect with HTTP/2 ALPN negotiation (for gateway reverse proxy)
+    pub async fn connect_h2(&self, host: &str, port: u16) -> Result<TlsStream<BoxStream>> {
+        self.connect_inner(host, port, true).await
+    }
+
+    fn apply_alpn(config: Arc<ClientConfig>, h2: bool) -> Arc<ClientConfig> {
+        if !h2 {
+            return config;
+        }
+        let mut cfg = (*config).clone();
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Arc::new(cfg)
+    }
+
+    async fn connect_inner(&self, host: &str, port: u16, h2_alpn: bool) -> Result<TlsStream<BoxStream>> {
         let start = std::time::Instant::now();
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid server name: {}", host)))?;
@@ -95,7 +113,7 @@ impl DohTlsConnector {
                 #[cfg(feature = "ech")]
                 None,
             ).await?;
-            let connector = TlsConnector::from(tls_config);
+            let connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
             let tcp_stream = self.connect_tcp(host, port).await?;
             let tls_stream = self
                 .finish_tls(&connector, server_name, tcp_stream, host, port)
@@ -146,7 +164,7 @@ impl DohTlsConnector {
             #[cfg(feature = "ech")]
             ech_config.as_ref(),
         ).await?;
-        let connector = TlsConnector::from(tls_config);
+        let connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
 
         if self.upstream_proxy.as_ref().filter(|proxy| proxy.is_valid()).is_some() {
             let tcp_stream = self.connect_tcp(host, port).await?;
