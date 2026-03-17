@@ -71,7 +71,8 @@ impl DohProxyServer {
             config.server_ip.clone(),
         ));
 
-        let cert_manager = if config.enable_doh && !config.gateway_mode {
+        // gateway 模式下仍需要 cert_manager：WebView 通过 CONNECT 走 MITM
+        let cert_manager = if config.enable_doh {
             Some(Arc::new(CertManager::new()?))
         } else {
             None
