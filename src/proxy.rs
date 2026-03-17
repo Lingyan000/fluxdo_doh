@@ -9,7 +9,15 @@ use crate::dns::DnsResolver;
 use crate::ech::DohTlsConnector;
 use crate::error::{DohProxyError, Result};
 use crate::ProxyConfig;
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1 as hyper_http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::TokioIo;
 use parking_lot::RwLock;
+use std::convert::Infallible;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -122,10 +130,20 @@ impl DohProxyServer {
                             let cert_manager = self.cert_manager.clone();
 
                             tokio::spawn(async move {
-                                if let Err(e) = handle_connection(
+                                if gateway_mode && enable_doh {
+                                    // Gateway 模式：用 hyper server 统一处理
+                                    // CONNECT → MITM (WebView)
+                                    // 其他方法 → HTTP/2 反向代理 (Dio)
+                                    if let Err(e) = handle_gateway_connection(
+                                        stream,
+                                        doh_tls_connector,
+                                        cert_manager,
+                                    ).await {
+                                        debug!("Gateway connection error from {}: {}", peer_addr, e);
+                                    }
+                                } else if let Err(e) = handle_connection(
                                     stream,
                                     enable_doh,
-                                    gateway_mode,
                                     doh_tls_connector,
                                     cert_manager,
                                 ).await {
@@ -158,7 +176,6 @@ impl DohProxyServer {
 async fn handle_connection(
     client: TcpStream,
     enable_doh: bool,
-    gateway_mode: bool,
     doh_tls_connector: Arc<DohTlsConnector>,
     cert_manager: Option<Arc<CertManager>>,
 ) -> Result<()> {
@@ -186,8 +203,6 @@ async fn handle_connection(
         } else {
             handle_connect_tunnel(reader, writer, &target, doh_tls_connector).await
         }
-    } else if gateway_mode && enable_doh {
-        handle_gateway_forward(reader, writer, method, &target, doh_tls_connector).await
     } else {
         writer
             .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nOnly CONNECT method is supported\r\n")
@@ -334,101 +349,272 @@ async fn handle_connect_mitm(
     Ok(())
 }
 
-/// Handle a plain HTTP request in gateway (reverse proxy) mode.
+/// Handle a gateway (reverse proxy) connection using hyper.
 ///
-/// Accepts plain HTTP from the client, reads the Host header to determine
-/// the target server, connects with TLS+ECH, then byte-copies bidirectionally.
-/// This eliminates the double TLS overhead of MITM mode.
-async fn handle_gateway_forward(
-    mut reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
-    writer: tokio::net::tcp::OwnedWriteHalf,
-    method: &str,
-    target: &str,
-    doh_tls_connector: Arc<DohTlsConnector>,
+/// Uses hyper HTTP/1.1 server on the client side, hyper HTTP/2 (or HTTP/1.1)
+/// client on the server side. Supports keep-alive with multi-host routing
+/// and server-side connection pooling via HTTP/2 multiplexing.
+async fn handle_gateway_connection(
+    stream: TcpStream,
+    connector: Arc<DohTlsConnector>,
+    cert_manager: Option<Arc<CertManager>>,
 ) -> Result<()> {
-    // Read headers, extract Host
-    let mut header_bytes = Vec::new();
-    let mut host_value = String::new();
+    let io = TokioIo::new(stream);
+    let pool: GatewayPool =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        if line.trim().is_empty() {
-            header_bytes.extend_from_slice(line.as_bytes());
-            break;
+    let service = service_fn(move |req: Request<Incoming>| {
+        let connector = connector.clone();
+        let cert_manager = cert_manager.clone();
+        let pool = pool.clone();
+        async move {
+            if req.method() == hyper::Method::CONNECT {
+                gateway_handle_connect(req, connector, cert_manager).await
+            } else {
+                gateway_forward_request(req, connector, pool).await
+            }
         }
-        if let Some(val) = line.strip_prefix("Host:").or_else(|| line.strip_prefix("host:")) {
-            host_value = val.trim().to_string();
-        }
-        header_bytes.extend_from_slice(line.as_bytes());
+    });
+
+    hyper_http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(io, service)
+        .with_upgrades()
+        .await
+        .map_err(|e| DohProxyError::Proxy(format!("Gateway hyper error: {}", e)))
+}
+
+type GatewayBody = BoxBody<Bytes, hyper::Error>;
+type GatewayResponse = std::result::Result<Response<GatewayBody>, Infallible>;
+
+/// 只缓存 HTTP/2 sender（可 clone 多路复用），HTTP/1.1 不缓存。
+type GatewayPool = Arc<tokio::sync::Mutex<std::collections::HashMap<String, hyper::client::conn::http2::SendRequest<Incoming>>>>;
+
+enum GatewaySender {
+    H2(hyper::client::conn::http2::SendRequest<Incoming>),
+    H1(hyper::client::conn::http1::SendRequest<Incoming>),
+}
+
+fn gateway_error_response(status: u16, msg: &str) -> Response<GatewayBody> {
+    let body = Full::new(Bytes::from(msg.to_owned()))
+        .map_err(|never| match never {})
+        .boxed();
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain")
+        .body(body)
+        .unwrap()
+}
+
+/// Forward a plain HTTP request to the real server via TLS+ECH (HTTP/2 preferred).
+async fn gateway_forward_request(
+    req: Request<Incoming>,
+    connector: Arc<DohTlsConnector>,
+    pool: GatewayPool,
+) -> GatewayResponse {
+    let host_header = req
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    if host_header.is_empty() {
+        return Ok(gateway_error_response(400, "Missing Host header"));
     }
 
-    if host_value.is_empty() {
-        let mut writer = writer;
-        writer
-            .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\nMissing Host header\r\n")
-            .await?;
-        return Ok(());
+    let (host, port) = match gateway_parse_host(&host_header) {
+        Some(hp) => hp,
+        None => return Ok(gateway_error_response(400, "Invalid Host header")),
+    };
+    let host_key = format!("{}:{}", host, port);
+
+    debug!("Gateway {} {} -> {}", req.method(), req.uri(), host_key);
+
+    // Try to get a pooled H2 sender (H1 is not pooled)
+    let mut sender: Option<GatewaySender> = {
+        let mut p = pool.lock().await;
+        match p.get(&host_key) {
+            Some(s) if s.is_ready() => Some(GatewaySender::H2(s.clone())),
+            _ => {
+                p.remove(&host_key);
+                None
+            }
+        }
+    };
+
+    // Create new connection if needed
+    if sender.is_none() {
+        let tls = match connector.connect_h2(&host, port).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Gateway connect failed for {}: {}", host_key, e);
+                return Ok(gateway_error_response(502, &format!("Connect failed: {}", e)));
+            }
+        };
+
+        // Check negotiated ALPN
+        let alpn = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
+        let is_h2 = alpn.as_deref() == Some(b"h2");
+        let io = TokioIo::new(tls);
+
+        if is_h2 {
+            debug!("Gateway: HTTP/2 connection to {}", host_key);
+            let (s, conn) = hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                io,
+            )
+            .await
+            .map_err(|e| warn!("Gateway H2 handshake failed: {}", e))
+            .unwrap_or_else(|_| unreachable!());
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    debug!("Gateway H2 conn closed: {}", e);
+                }
+            });
+            let s_clone = s.clone();
+            sender = Some(GatewaySender::H2(s));
+            pool.lock().await.insert(host_key.clone(), s_clone);
+        } else {
+            debug!("Gateway: HTTP/1.1 connection to {}", host_key);
+            let (s, conn) = hyper::client::conn::http1::handshake(io)
+                .await
+                .map_err(|e| warn!("Gateway H1 handshake failed: {}", e))
+                .unwrap_or_else(|_| unreachable!());
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    debug!("Gateway H1 conn closed: {}", e);
+                }
+            });
+            // H1 不能 clone/多路复用，不入池
+            sender = Some(GatewaySender::H1(s));
+        }
     }
 
-    // Parse host (may include port)
-    let (host, port) = if host_value.contains(':') {
-        parse_host_port(&host_value)?
+    // Rewrite URI: 客户端发来的是相对路径 /path，HTTP/2 需要绝对 URI（:authority + :scheme）
+    let mut req = req;
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let authority = if port == 443 {
+        host.clone()
     } else {
-        (host_value.clone(), 443)
+        format!("{}:{}", host, port)
+    };
+    if let Ok(new_uri) = format!("https://{}{}", authority, path_and_query).parse() {
+        *req.uri_mut() = new_uri;
+    }
+
+    // Forward the request
+    let result = match sender.unwrap() {
+        GatewaySender::H2(mut s) => s.send_request(req).await,
+        GatewaySender::H1(mut s) => s.send_request(req).await,
     };
 
-    info!("Gateway {} {} -> {}:{}", method, target, host, port);
-
-    // Connect to real server with TLS+ECH
-    let server_tls = match doh_tls_connector.connect(&host, port).await {
-        Ok(stream) => stream,
+    match result {
+        Ok(resp) => Ok(resp.map(|b| b.boxed())),
         Err(e) => {
-            warn!("Gateway: failed to connect to {}:{}: {}", host, port, e);
-            let msg = format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{}\r\n", e);
-            let mut writer = writer;
-            writer.write_all(msg.as_bytes()).await?;
-            return Err(e);
-        }
-    };
-
-    info!("Gateway: TLS+ECH connected to {}:{}", host, port);
-
-    // Build prefix: first line + headers (already read from client)
-    let first_line = format!("{} {} HTTP/1.1\r\n", method, target);
-    let mut prefix = Vec::with_capacity(first_line.len() + header_bytes.len());
-    prefix.extend_from_slice(first_line.as_bytes());
-    prefix.extend_from_slice(&header_bytes);
-    // Include any remaining buffered data
-    prefix.extend_from_slice(reader.buffer());
-
-    // Reunite client stream and prepend already-read bytes
-    let read_half = reader.into_inner();
-    let client_stream = read_half.reunite(writer).map_err(|_| {
-        DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string())
-    })?;
-    let client_stream = PrefixedStream::new(client_stream, prefix);
-
-    // Bidirectional byte copy: plain client ↔ TLS server
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut server_read, mut server_write) = tokio::io::split(server_tls);
-
-    let client_to_server = tokio::io::copy(&mut client_read, &mut server_write);
-    let server_to_client = tokio::io::copy(&mut server_read, &mut client_write);
-
-    match tokio::try_join!(client_to_server, server_to_client) {
-        Ok((to_server, to_client)) => {
-            debug!(
-                "Gateway closed: {}:{} (sent: {}, received: {})",
-                host, port, to_server, to_client
-            );
-        }
-        Err(e) => {
-            debug!("Gateway error: {}:{} - {}", host, port, e);
+            warn!("Gateway forward failed for {}: {}", host_key, e);
+            // Remove broken connection from pool
+            pool.lock().await.remove(&host_key);
+            Ok(gateway_error_response(502, &format!("Forward failed: {}", e)))
         }
     }
+}
+
+/// Handle CONNECT in gateway mode (WebView MITM).
+async fn gateway_handle_connect(
+    req: Request<Incoming>,
+    connector: Arc<DohTlsConnector>,
+    cert_manager: Option<Arc<CertManager>>,
+) -> GatewayResponse {
+    let target = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
+    let (host, port) = match gateway_parse_host(&target) {
+        Some(hp) => hp,
+        None => return Ok(gateway_error_response(400, "Invalid CONNECT target")),
+    };
+
+    info!("Gateway CONNECT (MITM) {}:{}", host, port);
+
+    let cert_manager = match cert_manager {
+        Some(cm) => cm,
+        None => return Ok(gateway_error_response(502, "Certificate manager not available")),
+    };
+
+    let connector_clone = connector.clone();
+    let host_clone = host.clone();
+
+    // Spawn MITM handling after upgrade
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let io = TokioIo::new(upgraded);
+                if let Err(e) =
+                    gateway_mitm_upgraded(io, &host_clone, port, connector_clone, cert_manager).await
+                {
+                    warn!("Gateway MITM error {}:{}: {}", host_clone, port, e);
+                }
+            }
+            Err(e) => warn!("Gateway CONNECT upgrade failed: {}", e),
+        }
+    });
+
+    // Return 200 to initiate the upgrade
+    let body = Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed();
+    Ok(Response::new(body))
+}
+
+/// Run MITM on an upgraded CONNECT connection (WebView).
+async fn gateway_mitm_upgraded<I>(
+    client_io: I,
+    host: &str,
+    port: u16,
+    connector: Arc<DohTlsConnector>,
+    cert_manager: Arc<CertManager>,
+) -> Result<()>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Connect to real server with TLS+ECH
+    let server_tls = connector.connect(host, port).await?;
+
+    // TLS handshake with client (MITM)
+    let server_config = cert_manager.get_server_config(host)?;
+    let acceptor = TlsAcceptor::from(server_config);
+    let client_tls = acceptor.accept(client_io).await.map_err(DohProxyError::Io)?;
+
+    // Bidirectional copy
+    let (mut cr, mut cw) = tokio::io::split(client_tls);
+    let (mut sr, mut sw) = tokio::io::split(server_tls);
+    let _ = tokio::try_join!(
+        tokio::io::copy(&mut cr, &mut sw),
+        tokio::io::copy(&mut sr, &mut cw),
+    );
 
     Ok(())
+}
+
+fn gateway_parse_host(host_header: &str) -> Option<(String, u16)> {
+    if host_header.starts_with('[') {
+        // IPv6: [::1]:443
+        let bracket_end = host_header.find(']')?;
+        let host = &host_header[1..bracket_end];
+        let port = host_header[bracket_end + 1..]
+            .strip_prefix(':')
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(443);
+        Some((host.to_string(), port))
+    } else if let Some(colon) = host_header.rfind(':') {
+        let host = &host_header[..colon];
+        let port = host_header[colon + 1..].parse().unwrap_or(443);
+        Some((host.to_string(), port))
+    } else {
+        Some((host_header.to_string(), 443))
+    }
 }
 
 /// Parse host:port from CONNECT target
