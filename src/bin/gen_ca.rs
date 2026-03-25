@@ -9,8 +9,9 @@ use std::path::Path;
 fn main() {
     println!("Generating CA certificate for DOH Proxy...");
 
-    // Generate CA using rcgen
-    let (cert_pem, key_pem) = generate_ca().expect("Failed to generate CA");
+    // 复用 CertManager::generate_ca_pem()
+    let (cert_pem, key_pem) =
+        doh_proxy::cert::CertManager::generate_ca_pem().expect("Failed to generate CA");
 
     // Create certs directory
     let certs_dir = Path::new("certs");
@@ -32,41 +33,12 @@ fn main() {
     fs::write(&der_path, pem_parsed.contents()).expect("Failed to write CA DER");
     println!("CA certificate (DER) written to: {}", der_path.display());
 
-    println!("\nDone! Copy certs/ca.der to android/app/src/main/res/raw/proxy_ca.der");
-}
+    // Also create PEM for Flutter assets
+    let assets_dir = Path::new("../../assets/certs");
+    fs::create_dir_all(assets_dir).expect("Failed to create assets/certs directory");
+    let assets_pem_path = assets_dir.join("proxy_ca.pem");
+    fs::write(&assets_pem_path, &cert_pem).expect("Failed to write assets PEM");
+    println!("CA certificate (PEM) written to: {}", assets_pem_path.display());
 
-fn generate_ca() -> Result<(String, String), Box<dyn std::error::Error>> {
-    use rcgen::{
-        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair,
-        KeyUsagePurpose,
-    };
-
-    let mut params = CertificateParams::default();
-
-    // Set CA distinguished name
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, "DOH Proxy CA");
-    dn.push(DnType::OrganizationName, "DOH Proxy");
-    dn.push(DnType::CountryName, "CN");
-    params.distinguished_name = dn;
-
-    // CA settings
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-
-    // Valid for 10 years
-    params.not_before = time::OffsetDateTime::now_utc();
-    params.not_after = params.not_before + time::Duration::days(3650);
-
-    // Generate key pair
-    let key_pair = KeyPair::generate()?;
-
-    // Self-sign the CA certificate
-    let cert = params.self_signed(&key_pair)?;
-
-    Ok((cert.pem(), key_pair.serialize_pem()))
+    println!("\nDone!");
 }

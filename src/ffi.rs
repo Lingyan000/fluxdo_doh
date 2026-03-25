@@ -479,6 +479,31 @@ pub extern "C" fn doh_proxy_clear_dns_cache() -> c_int {
     1
 }
 
+/// Generate a new CA certificate key pair.
+/// Returns a pointer to a JSON string: {"ok":true,"cert_pem":"...","key_pem":"..."}
+/// or {"ok":false,"error":"..."}
+/// The caller must free the returned string with doh_proxy_free_string.
+#[no_mangle]
+pub extern "C" fn doh_proxy_generate_ca() -> *mut c_char {
+    doh_proxy_init_logging();
+
+    match crate::cert::CertManager::generate_ca_pem() {
+        Ok((cert_pem, key_pem)) => {
+            let json = serde_json::json!({
+                "ok": true,
+                "cert_pem": cert_pem,
+                "key_pem": key_pem,
+            })
+            .to_string();
+            match std::ffi::CString::new(json) {
+                Ok(c) => c.into_raw(),
+                Err(_) => error_json("CString conversion failed"),
+            }
+        }
+        Err(e) => error_json(&format!("{}", e)),
+    }
+}
+
 /// Free a string returned by doh_proxy_lookup_ech_config / doh_proxy_lookup_ip / doh_proxy_lookup_host
 #[no_mangle]
 pub extern "C" fn doh_proxy_free_string(ptr: *mut c_char) {

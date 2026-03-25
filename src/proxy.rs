@@ -81,7 +81,12 @@ impl DohProxyServer {
 
         // gateway 模式下仍需要 cert_manager：WebView 通过 CONNECT 走 MITM
         let cert_manager = if config.enable_doh {
-            Some(Arc::new(CertManager::new()?))
+            let cm = if let (Some(cert), Some(key)) = (&config.ca_cert_pem, &config.ca_key_pem) {
+                CertManager::from_pem(cert, key)?   // 运行时 CA（per-device）
+            } else {
+                CertManager::new()?                  // 编译时 CA
+            };
+            Some(Arc::new(cm))
         } else {
             None
         };
@@ -124,20 +129,23 @@ impl DohProxyServer {
                     match result {
                         Ok((stream, peer_addr)) => {
                             debug!("New connection from {}", peer_addr);
+
                             let enable_doh = self.config.enable_doh;
                             let gateway_mode = self.config.gateway_mode;
+                            let mitm_connect = self.config.mitm_connect;
                             let doh_tls_connector = self.doh_tls_connector.clone();
                             let cert_manager = self.cert_manager.clone();
 
                             tokio::spawn(async move {
                                 if gateway_mode && enable_doh {
                                     // Gateway 模式：用 hyper server 统一处理
-                                    // CONNECT → MITM (WebView)
+                                    // CONNECT → MITM 或 tunnel（取决于 mitm_connect）
                                     // 其他方法 → HTTP/2 反向代理 (Dio)
                                     if let Err(e) = handle_gateway_connection(
                                         stream,
                                         doh_tls_connector,
                                         cert_manager,
+                                        mitm_connect,
                                     ).await {
                                         debug!("Gateway connection error from {}: {}", peer_addr, e);
                                     }
@@ -358,6 +366,7 @@ async fn handle_gateway_connection(
     stream: TcpStream,
     connector: Arc<DohTlsConnector>,
     cert_manager: Option<Arc<CertManager>>,
+    mitm_connect: bool,
 ) -> Result<()> {
     let io = TokioIo::new(stream);
     let pool: GatewayPool =
@@ -369,7 +378,11 @@ async fn handle_gateway_connection(
         let pool = pool.clone();
         async move {
             if req.method() == hyper::Method::CONNECT {
-                gateway_handle_connect(req, connector, cert_manager).await
+                if mitm_connect {
+                    gateway_handle_connect(req, connector, cert_manager).await
+                } else {
+                    gateway_handle_connect_tunnel(req, connector).await
+                }
             } else {
                 gateway_forward_request(req, connector, pool).await
             }
@@ -522,6 +535,53 @@ async fn gateway_forward_request(
             Ok(gateway_error_response(502, &format!("Forward failed: {}", e)))
         }
     }
+}
+
+/// Handle CONNECT in gateway mode as a plain tunnel (DOH resolution + raw TCP forwarding).
+/// Client does end-to-end TLS with the target server — no MITM, no custom CA needed.
+async fn gateway_handle_connect_tunnel(
+    req: Request<Incoming>,
+    connector: Arc<DohTlsConnector>,
+) -> GatewayResponse {
+    let target = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
+    let (host, port) = match gateway_parse_host(&target) {
+        Some(hp) => hp,
+        None => return Ok(gateway_error_response(400, "Invalid CONNECT target")),
+    };
+
+    info!("Gateway CONNECT (tunnel) {}:{}", host, port);
+
+    let connector_clone = connector.clone();
+    let host_clone = host.clone();
+
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let io = TokioIo::new(upgraded);
+                // Connect to remote via DOH-resolved address
+                match connector_clone.connect_tcp(&host_clone, port).await {
+                    Ok(server_stream) => {
+                        let (mut cr, mut cw) = tokio::io::split(io);
+                        let (mut sr, mut sw) = tokio::io::split(server_stream);
+                        let _ = tokio::try_join!(
+                            tokio::io::copy(&mut cr, &mut sw),
+                            tokio::io::copy(&mut sr, &mut cw),
+                        );
+                    }
+                    Err(e) => {
+                        warn!("Gateway tunnel connect failed {}:{}: {}", host_clone, port, e);
+                    }
+                }
+            }
+            Err(e) => warn!("Gateway CONNECT tunnel upgrade failed: {}", e),
+        }
+    });
+
+    // Return 200 to initiate the upgrade
+    let body = Full::new(Bytes::new())
+        .map_err(|never| match never {})
+        .boxed();
+    Ok(Response::new(body))
 }
 
 /// Handle CONNECT in gateway mode (WebView MITM).

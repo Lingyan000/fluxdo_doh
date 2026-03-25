@@ -152,6 +152,17 @@ pub struct ProxyConfig {
     /// Eliminates double TLS overhead compared to MITM mode
     #[serde(default)]
     pub gateway_mode: bool,
+    /// Whether CONNECT requests should use MITM (true) or plain tunnel (false).
+    /// Plain tunnel mode: DOH resolution + raw TCP forwarding, client does end-to-end TLS.
+    /// iOS requires plain tunnel because WKWebView's TLS challenge callback is too slow for MITM.
+    #[serde(default = "default_true")]
+    pub mitm_connect: bool,
+    /// Optional runtime CA certificate PEM (per-device CA for iOS)
+    #[serde(default)]
+    pub ca_cert_pem: Option<String>,
+    /// Optional runtime CA private key PEM (per-device CA for iOS)
+    #[serde(default)]
+    pub ca_key_pem: Option<String>,
 }
 
 impl Default for ProxyConfig {
@@ -167,6 +178,9 @@ impl Default for ProxyConfig {
             upstream_proxy: None,
             server_ip: None,
             gateway_mode: false,
+            mitm_connect: true,
+            ca_cert_pem: None,
+            ca_key_pem: None,
         }
     }
 }
@@ -176,6 +190,10 @@ fn default_upstream_protocol() -> String {
 }
 
 fn default_enable_doh() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 

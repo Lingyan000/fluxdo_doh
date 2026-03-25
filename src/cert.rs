@@ -6,8 +6,8 @@
 
 use crate::error::{DohProxyError, Result};
 use rcgen::{
-    Certificate, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -141,6 +141,70 @@ impl CertManager {
             .map_err(|e| DohProxyError::Certificate(format!("Failed to build config: {}", e)))?;
 
         Ok(config)
+    }
+
+    /// 从运行时 PEM 创建 CertManager（用于 per-device CA）
+    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
+        info!("Loading runtime CA certificate from PEM");
+
+        let ca_key_pair = KeyPair::from_pem(key_pem)
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to parse CA key: {}", e)))?;
+
+        let ca_cert = CertificateParams::from_ca_cert_pem(cert_pem)
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to parse CA cert: {}", e)))?
+            .self_signed(&ca_key_pair)
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to load CA cert: {}", e)))?;
+
+        let pem_parsed = pem::parse(cert_pem)
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to parse CA cert PEM: {}", e)))?;
+        let ca_cert_der = CertificateDer::from(pem_parsed.contents().to_vec());
+
+        let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
+
+        info!("Runtime CA certificate loaded successfully");
+
+        Ok(Self {
+            ca_key_pair,
+            ca_cert,
+            ca_cert_der,
+            cert_cache: RwLock::new(HashMap::new()),
+            crypto_provider,
+        })
+    }
+
+    /// 生成新的 CA 证书，返回 (cert_pem, key_pem)
+    pub fn generate_ca_pem() -> Result<(String, String)> {
+        info!("Generating new CA certificate");
+
+        let key_pair = KeyPair::generate()
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to generate CA key: {}", e)))?;
+
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "DOH Proxy CA");
+        dn.push(DnType::OrganizationName, "DOH Proxy");
+        dn.push(DnType::CountryName, "CN");
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        // 有效期 10 年
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now;
+        params.not_after = now + time::Duration::days(3650);
+
+        let cert = params
+            .self_signed(&key_pair)
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to self-sign CA: {}", e)))?;
+
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        info!("CA certificate generated successfully");
+        Ok((cert_pem, key_pem))
     }
 
     /// Get CA certificate PEM for export (to install on device)
