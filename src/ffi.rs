@@ -504,6 +504,18 @@ pub extern "C" fn doh_proxy_generate_ca() -> *mut c_char {
     }
 }
 
+/// 获取编译时嵌入的 CA 证书 PEM
+///
+/// 返回的字符串需要调用 doh_proxy_free_string 释放
+#[no_mangle]
+pub extern "C" fn doh_proxy_get_embedded_ca_pem() -> *mut c_char {
+    let pem = crate::cert::CertManager::get_embedded_ca_pem();
+    match std::ffi::CString::new(pem) {
+        Ok(c) => c.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// Free a string returned by doh_proxy_lookup_ech_config / doh_proxy_lookup_ip / doh_proxy_lookup_host
 #[no_mangle]
 pub extern "C" fn doh_proxy_free_string(ptr: *mut c_char) {
