@@ -22,6 +22,9 @@ jobs:
       - name: Install cmake and NASM for ECH support
         run: choco install cmake nasm -y
 
+      - name: Generate CA certificates
+        run: cargo run --bin gen_ca
+
       - name: Build
         run: cargo build --release --features ech
 
@@ -29,7 +32,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: doh-proxy-windows
-          path: target/release/doh_proxy_bin.exe
+          path: |
+            target/release/doh_proxy_bin.exe
+            certs/ca.crt
+            certs/ca.der
 
   build-linux:
     runs-on: ubuntu-latest
@@ -42,6 +48,9 @@ jobs:
       - name: Install cmake for ECH support
         run: sudo apt-get update && sudo apt-get install -y cmake
 
+      - name: Generate CA certificates
+        run: cargo run --bin gen_ca
+
       - name: Build
         run: cargo build --release --features ech
 
@@ -49,7 +58,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: doh-proxy-linux
-          path: target/release/doh_proxy_bin
+          path: |
+            target/release/doh_proxy_bin
+            certs/ca.crt
+            certs/ca.der
 
   build-macos:
     runs-on: macos-latest
@@ -62,6 +74,9 @@ jobs:
       - name: Install cmake for ECH support
         run: brew install cmake
 
+      - name: Generate CA certificates
+        run: cargo run --bin gen_ca
+
       - name: Build
         run: cargo build --release --features ech
 
@@ -69,7 +84,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: doh-proxy-macos
-          path: target/release/doh_proxy_bin
+          path: |
+            target/release/doh_proxy_bin
+            certs/ca.crt
+            certs/ca.der
 
   build-android:
     runs-on: ubuntu-latest
@@ -97,6 +115,9 @@ jobs:
         with:
           packages: 'ndk;25.2.9519653'
 
+      - name: Generate CA certificates
+        run: cargo run --bin gen_ca
+
       - name: Build for Android
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/25.2.9519653
@@ -112,3 +133,5 @@ jobs:
             target/armv7-linux-androideabi/release/libdoh_proxy.so
             target/x86_64-linux-android/release/libdoh_proxy.so
             target/i686-linux-android/release/libdoh_proxy.so
+            certs/ca.crt
+            certs/ca.der
