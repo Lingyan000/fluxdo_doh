@@ -133,12 +133,15 @@ impl CertManager {
         let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
 
         // Build server config with cert chain (leaf + CA)
-        let config = ServerConfig::builder_with_provider(self.crypto_provider.clone())
+        let mut config = ServerConfig::builder_with_provider(self.crypto_provider.clone())
             .with_safe_default_protocol_versions()
             .map_err(DohProxyError::Tls)?
             .with_no_client_auth()
             .with_single_cert(vec![cert_der, self.ca_cert_der.clone()], key_der)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to build config: {}", e)))?;
+
+        // ALPN: 仅提供 http/1.1，MITM 做 raw byte copy 无法翻译 h2↔h1
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         Ok(config)
     }
@@ -209,6 +212,11 @@ impl CertManager {
 
     /// Get CA certificate PEM for export (to install on device)
     pub fn get_ca_cert_pem(&self) -> &'static str {
+        CA_CERT_PEM
+    }
+
+    /// 获取编译时嵌入的 CA 证书 PEM（静态方法，无需实例）
+    pub fn get_embedded_ca_pem() -> &'static str {
         CA_CERT_PEM
     }
 }

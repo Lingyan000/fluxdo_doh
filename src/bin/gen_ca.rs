@@ -40,5 +40,12 @@ fn main() {
     fs::write(&assets_pem_path, &cert_pem).expect("Failed to write assets PEM");
     println!("CA certificate (PEM) written to: {}", assets_pem_path.display());
 
+    // Also copy DER for Android res/raw (network_security_config.xml references it)
+    let android_raw_dir = Path::new("../../android/app/src/main/res/raw");
+    fs::create_dir_all(android_raw_dir).expect("Failed to create android res/raw directory");
+    let android_der_path = android_raw_dir.join("proxy_ca.der");
+    fs::write(&android_der_path, pem_parsed.contents()).expect("Failed to write Android DER");
+    println!("CA certificate (DER) written to: {}", android_der_path.display());
+
     println!("\nDone!");
 }

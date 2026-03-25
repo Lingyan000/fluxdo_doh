@@ -60,6 +60,12 @@ fn main() {
                 let _ = fs::copy("certs/ca.crt", assets_dir.join("proxy_ca.pem"));
             }
 
+            // 复制 DER 到 Android res/raw（network_security_config.xml 引用）
+            let android_raw_dir = Path::new("../../android/app/src/main/res/raw");
+            if android_raw_dir.exists() || fs::create_dir_all(android_raw_dir).is_ok() {
+                let _ = fs::copy("certs/ca.der", android_raw_dir.join("proxy_ca.der"));
+            }
+
             eprintln!("CA certificates generated successfully via openssl.");
         }
         _ => {
