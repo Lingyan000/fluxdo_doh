@@ -21,3 +21,8 @@
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated CA certificates (CI/local build auto-generates)
+certs/ca.crt
+certs/ca.key
+certs/ca.der
