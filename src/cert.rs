@@ -44,17 +44,14 @@ impl CertManager {
         let ca_key_pair = KeyPair::from_pem(CA_KEY_PEM)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to parse CA key: {}", e)))?;
 
-        // Load CA certificate from PEM (NOT regenerate!)
-        // This ensures we use the exact same certificate that Android trusts
+        // 从 PEM 解析参数后用同一个 key 重建 Certificate 对象（rcgen 签发叶子证书需要）
         let ca_cert = CertificateParams::from_ca_cert_pem(CA_CERT_PEM)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to parse CA cert: {}", e)))?
             .self_signed(&ca_key_pair)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to load CA cert: {}", e)))?;
 
-        // Parse CA cert DER from PEM
-        let pem = pem::parse(CA_CERT_PEM)
-            .map_err(|e| DohProxyError::Certificate(format!("Failed to parse CA cert PEM: {}", e)))?;
-        let ca_cert_der = CertificateDer::from(pem.contents().to_vec());
+        // 使用重建后的证书 DER，确保和 signed_by 使用的 issuer 一致
+        let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
 
         let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
 
@@ -158,9 +155,8 @@ impl CertManager {
             .self_signed(&ca_key_pair)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to load CA cert: {}", e)))?;
 
-        let pem_parsed = pem::parse(cert_pem)
-            .map_err(|e| DohProxyError::Certificate(format!("Failed to parse CA cert PEM: {}", e)))?;
-        let ca_cert_der = CertificateDer::from(pem_parsed.contents().to_vec());
+        // 使用重建后的证书 DER，确保和 signed_by 使用的 issuer 一致
+        let ca_cert_der = CertificateDer::from(ca_cert.der().to_vec());
 
         let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
 
