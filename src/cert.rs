@@ -96,6 +96,12 @@ impl CertManager {
         // Create certificate parameters
         let mut params = CertificateParams::default();
 
+        // 显式设置有效期 ≤ 398 天（Apple ATS/CFNetwork 策略，macOS 26 Tahoe / WKWebView 严格执行）
+        // rcgen 默认 not_before=1975 / not_after=4096，会被 WKWebView 判定为非法证书
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(397);
+
         // Set distinguished name
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, hostname);
@@ -115,6 +121,10 @@ impl CertManager {
 
         // Not a CA
         params.is_ca = IsCa::NoCa;
+
+        // 启用 Authority Key Identifier 扩展，让 macOS SecTrust 能通过 AKI→CA 的 SKI
+        // 构建证书链。缺少 AKI 会导致 MissingIntermediate 错误，WKWebView 拒绝信任。
+        params.use_authority_key_identifier_extension = true;
 
         // Generate key pair for this certificate
         let key_pair = KeyPair::generate()
