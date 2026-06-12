@@ -157,6 +157,10 @@ pub struct ProxyConfig {
     /// iOS requires plain tunnel because WKWebView's TLS challenge callback is too slow for MITM.
     #[serde(default = "default_true")]
     pub mitm_connect: bool,
+    /// WebView MITM 是否启用 HTTP/2：client 协商 h2 时用 hyper 转发实现多路复用；
+    /// 关闭则保持裸字节拷贝（锁 http/1.1）。默认关闭，需实测 CF 指纹后再开。
+    #[serde(default)]
+    pub h2_mitm: bool,
     /// Optional runtime CA certificate PEM (per-device CA for iOS)
     #[serde(default)]
     pub ca_cert_pem: Option<String>,
@@ -179,6 +183,7 @@ impl Default for ProxyConfig {
             server_ip: None,
             gateway_mode: false,
             mitm_connect: true,
+            h2_mitm: false,
             ca_cert_pem: None,
             ca_key_pem: None,
         }

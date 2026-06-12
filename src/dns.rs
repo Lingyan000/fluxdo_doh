@@ -36,6 +36,8 @@ const DEFAULT_TTL_SECS: u64 = 300;
 const CLEANUP_INTERVAL: u64 = 100;
 /// 成功连通后的 host -> ip 粘性缓存时长
 const STICKY_IP_TTL_SECS: u64 = 600;
+/// ECH 负结果（确定无 ECH）缓存时长，取短值以便域名启用 ECH 后尽快生效
+const ECH_NEGATIVE_TTL_SECS: u64 = 60;
 
 static SHARED_RESOLVERS: OnceLock<Arc<AsyncRwLock<HashMap<String, Arc<DnsResolver>>>>> =
     OnceLock::new();
@@ -53,6 +55,8 @@ pub struct DnsResolver {
     force_doh_get_ech: bool,
     /// Cache for ECH configs (domain -> ECHConfigList)
     ech_cache: Arc<RwLock<HashMap<String, CachedEchConfig>>>,
+    /// 确定无 ECH 的域名负缓存 (domain -> 过期时间)，避免每次 connect 重查 HTTPS 记录
+    ech_negative_cache: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     /// Cache for IP addresses
     ip_cache: Arc<RwLock<HashMap<String, CachedIpAddrs>>>,
     ech_inflight: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
@@ -401,6 +405,7 @@ impl DnsResolver {
             doh_client_ech: None,
             force_doh_get_ech: false,
             ech_cache: Arc::new(RwLock::new(HashMap::new())),
+            ech_negative_cache: Arc::new(RwLock::new(HashMap::new())),
             ip_cache: Arc::new(RwLock::new(HashMap::new())),
             ech_inflight: Arc::new(Mutex::new(HashMap::new())),
             ip_inflight: Arc::new(Mutex::new(HashMap::new())),
@@ -426,6 +431,12 @@ impl DnsResolver {
                     return Ok(Some(cached.config.clone()));
                 }
             }
+        }
+
+        // 命中负缓存（确定无 ECH）则直接返回，避免重复查 HTTPS 记录
+        if self.ech_negative_hit(domain) {
+            debug!("ECH negative cache hit for {}", domain);
+            return Ok(None);
         }
 
         info!("Looking up HTTPS record for ECH config: {}", domain);
@@ -775,12 +786,14 @@ impl DnsResolver {
     pub fn clear_host_cache(&self, domain: &str) {
         self.ip_cache.write().remove(domain);
         self.ech_cache.write().remove(domain);
+        self.ech_negative_cache.write().remove(domain);
         self.preferred_host_ip_cache.write().remove(domain);
     }
 
     pub fn clear_all_caches(&self) {
         self.ip_cache.write().clear();
         self.ech_cache.write().clear();
+        self.ech_negative_cache.write().clear();
         self.ip_rtt_cache.write().clear();
         self.preferred_host_ip_cache.write().clear();
     }
@@ -880,6 +893,8 @@ impl DnsResolver {
 
     /// 写入 ECH 缓存，超过上限时淘汰过期条目
     fn put_ech_cache(&self, domain: &str, config: EchConfigListBytes<'static>, ttl: Duration) {
+        // 找到 ECH，清除可能存在的负缓存
+        self.ech_negative_cache.write().remove(domain);
         let mut cache = self.ech_cache.write();
         cache.insert(
             domain.to_string(),
@@ -891,6 +906,27 @@ impl DnsResolver {
         if cache.len() > MAX_CACHE_SIZE {
             Self::evict_expired_ech(&mut cache);
         }
+    }
+
+    /// 写入 ECH 负缓存（确定无 ECH 时调用）
+    fn put_ech_negative(&self, domain: &str) {
+        let expires_at = std::time::Instant::now() + Duration::from_secs(ECH_NEGATIVE_TTL_SECS);
+        let mut cache = self.ech_negative_cache.write();
+        cache.insert(domain.to_string(), expires_at);
+        if cache.len() > MAX_CACHE_SIZE {
+            let now = std::time::Instant::now();
+            cache.retain(|_, exp| *exp > now);
+        }
+    }
+
+    /// 查询 ECH 负缓存是否命中且未过期
+    fn ech_negative_hit(&self, domain: &str) -> bool {
+        let now = std::time::Instant::now();
+        self.ech_negative_cache
+            .read()
+            .get(domain)
+            .map(|exp| *exp > now)
+            .unwrap_or(false)
     }
 
     /// 淘汰过期 IP 缓存条目
@@ -931,6 +967,7 @@ impl DnsResolver {
         let now = std::time::Instant::now();
         self.ip_cache.write().retain(|_, v| v.expires_at > now);
         self.ech_cache.write().retain(|_, v| v.expires_at > now);
+        self.ech_negative_cache.write().retain(|_, exp| *exp > now);
         self.ip_rtt_cache.write().retain(|_, v| v.expires_at > now);
         self.preferred_host_ip_cache
             .write()
@@ -1030,6 +1067,8 @@ impl DnsResolver {
             }
         }
 
+        // 收到响应但记录中没有 ECH 参数：确定无 ECH，写入负缓存
+        self.put_ech_negative(domain);
         Ok(None)
     }
 

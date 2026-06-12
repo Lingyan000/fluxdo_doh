@@ -82,9 +82,9 @@ impl DohProxyServer {
         // gateway 模式下仍需要 cert_manager：WebView 通过 CONNECT 走 MITM
         let cert_manager = if config.enable_doh {
             let cm = if let (Some(cert), Some(key)) = (&config.ca_cert_pem, &config.ca_key_pem) {
-                CertManager::from_pem(cert, key)?   // 运行时 CA（per-device）
+                CertManager::from_pem(cert, key, config.h2_mitm)?   // 运行时 CA（per-device）
             } else {
-                CertManager::new()?                  // 编译时 CA
+                CertManager::new(config.h2_mitm)?                  // 编译时 CA
             };
             Some(Arc::new(cm))
         } else {
@@ -133,6 +133,7 @@ impl DohProxyServer {
                             let enable_doh = self.config.enable_doh;
                             let gateway_mode = self.config.gateway_mode;
                             let mitm_connect = self.config.mitm_connect;
+                            let h2_mitm = self.config.h2_mitm;
                             let doh_tls_connector = self.doh_tls_connector.clone();
                             let cert_manager = self.cert_manager.clone();
 
@@ -146,6 +147,7 @@ impl DohProxyServer {
                                         doh_tls_connector,
                                         cert_manager,
                                         mitm_connect,
+                                        h2_mitm,
                                     ).await {
                                         debug!("Gateway connection error from {}: {}", peer_addr, e);
                                     }
@@ -154,6 +156,7 @@ impl DohProxyServer {
                                     enable_doh,
                                     doh_tls_connector,
                                     cert_manager,
+                                    h2_mitm,
                                 ).await {
                                     warn!("Connection error from {}: {}", peer_addr, e);
                                 }
@@ -186,6 +189,7 @@ async fn handle_connection(
     enable_doh: bool,
     doh_tls_connector: Arc<DohTlsConnector>,
     cert_manager: Option<Arc<CertManager>>,
+    h2_mitm: bool,
 ) -> Result<()> {
     let (read_half, write_half) = client.into_split();
     let mut reader = BufReader::new(read_half);
@@ -207,7 +211,7 @@ async fn handle_connection(
             let cert_manager = cert_manager.ok_or_else(|| {
                 DohProxyError::Proxy("MITM mode requires certificate manager".to_string())
             })?;
-            handle_connect_mitm(reader, writer, &target, doh_tls_connector, cert_manager).await
+            handle_connect_mitm(reader, writer, &target, doh_tls_connector, cert_manager, h2_mitm).await
         } else {
             handle_connect_tunnel(reader, writer, &target, doh_tls_connector).await
         }
@@ -287,6 +291,7 @@ async fn handle_connect_mitm(
     target: &str,
     doh_tls_connector: Arc<DohTlsConnector>,
     cert_manager: Arc<CertManager>,
+    h2_mitm: bool,
 ) -> Result<()> {
     let (host, port) = parse_host_port(target)?;
 
@@ -298,6 +303,33 @@ async fn handle_connect_mitm(
         if line.trim().is_empty() {
             break;
         }
+    }
+
+    // h2 MITM 路径：写 200 后用 hyper 自动协商 client h1/h2 并转发到上游（带 ECH）。
+    // 上游连接由转发 service 内部按需建立、失败以 502 响应返回，故不在此预连。
+    if h2_mitm {
+        writer
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+
+        let buffered = reader.buffer().to_vec();
+        let read_half = reader.into_inner();
+        let client_stream = read_half.reunite(writer).map_err(|_| {
+            DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string())
+        })?;
+        let client_stream = PrefixedStream::new(client_stream, buffered);
+
+        let server_config = cert_manager.get_server_config(&host)?;
+        let acceptor = TlsAcceptor::from(server_config);
+        let client_tls = match acceptor.accept(client_stream).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("Client TLS handshake failed for {}: {}", host, e);
+                return Err(DohProxyError::Io(e));
+            }
+        };
+        info!("Client TLS handshake complete for {} (h2 MITM)", host);
+        return mitm_serve(client_tls, host, port, doh_tls_connector).await;
     }
 
     let server_tls = match doh_tls_connector.connect(&host, port).await {
@@ -367,6 +399,7 @@ async fn handle_gateway_connection(
     connector: Arc<DohTlsConnector>,
     cert_manager: Option<Arc<CertManager>>,
     mitm_connect: bool,
+    h2_mitm: bool,
 ) -> Result<()> {
     let io = TokioIo::new(stream);
     let pool: GatewayPool =
@@ -379,12 +412,12 @@ async fn handle_gateway_connection(
         async move {
             if req.method() == hyper::Method::CONNECT {
                 if mitm_connect {
-                    gateway_handle_connect(req, connector, cert_manager).await
+                    gateway_handle_connect(req, connector, cert_manager, h2_mitm).await
                 } else {
                     gateway_handle_connect_tunnel(req, connector).await
                 }
             } else {
-                gateway_forward_request(req, connector, pool).await
+                gateway_forward_request(req, connector, pool, None).await
             }
         }
     });
@@ -424,21 +457,28 @@ async fn gateway_forward_request(
     req: Request<Incoming>,
     connector: Arc<DohTlsConnector>,
     pool: GatewayPool,
+    forced_target: Option<(String, u16)>,
 ) -> GatewayResponse {
-    let host_header = req
-        .headers()
-        .get(hyper::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-
-    if host_header.is_empty() {
-        return Ok(gateway_error_response(400, "Missing Host header"));
-    }
-
-    let (host, port) = match gateway_parse_host(&host_header) {
+    // MITM 单 host 场景由 forced_target 指定目标；gateway 反代场景从 Host 头解析
+    let (host, port) = match forced_target {
         Some(hp) => hp,
-        None => return Ok(gateway_error_response(400, "Invalid Host header")),
+        None => {
+            let host_header = req
+                .headers()
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+
+            if host_header.is_empty() {
+                return Ok(gateway_error_response(400, "Missing Host header"));
+            }
+
+            match gateway_parse_host(&host_header) {
+                Some(hp) => hp,
+                None => return Ok(gateway_error_response(400, "Invalid Host header")),
+            }
+        }
     };
     let host_key = format!("{}:{}", host, port);
 
@@ -537,6 +577,33 @@ async fn gateway_forward_request(
     }
 }
 
+/// h2 MITM：在已建立的 client TLS 上用 hyper 自动协商 h1/h2，把每个请求转发到上游（带 ECH）。
+/// CONNECT 已固定单 host，所有 h2 stream 复用同一条上游连接（h2 多路复用）。
+async fn mitm_serve<I>(
+    client_io: I,
+    host: String,
+    port: u16,
+    connector: Arc<DohTlsConnector>,
+) -> Result<()>
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(client_io);
+    // 单 host 连接池：h2 上游 sender 可 clone 多路复用
+    let pool: GatewayPool = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let service = service_fn(move |req: Request<Incoming>| {
+        let connector = connector.clone();
+        let pool = pool.clone();
+        let target = (host.clone(), port);
+        async move { gateway_forward_request(req, connector, pool, Some(target)).await }
+    });
+
+    hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .serve_connection_with_upgrades(io, service)
+        .await
+        .map_err(|e| DohProxyError::Proxy(format!("MITM h2 serve error: {}", e)))
+}
+
 /// Handle CONNECT in gateway mode as a plain tunnel (DOH resolution + raw TCP forwarding).
 /// Client does end-to-end TLS with the target server — no MITM, no custom CA needed.
 async fn gateway_handle_connect_tunnel(
@@ -589,6 +656,7 @@ async fn gateway_handle_connect(
     req: Request<Incoming>,
     connector: Arc<DohTlsConnector>,
     cert_manager: Option<Arc<CertManager>>,
+    h2_mitm: bool,
 ) -> GatewayResponse {
     let target = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
     let (host, port) = match gateway_parse_host(&target) {
@@ -612,7 +680,7 @@ async fn gateway_handle_connect(
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
                 if let Err(e) =
-                    gateway_mitm_upgraded(io, &host_clone, port, connector_clone, cert_manager).await
+                    gateway_mitm_upgraded(io, &host_clone, port, connector_clone, cert_manager, h2_mitm).await
                 {
                     warn!("Gateway MITM error {}:{}: {}", host_clone, port, e);
                 }
@@ -635,10 +703,19 @@ async fn gateway_mitm_upgraded<I>(
     port: u16,
     connector: Arc<DohTlsConnector>,
     cert_manager: Arc<CertManager>,
+    h2_mitm: bool,
 ) -> Result<()>
 where
-    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // h2 MITM：accept client TLS（ALPN 含 h2）后交给 hyper 转发，上游按需连（带 ECH）
+    if h2_mitm {
+        let server_config = cert_manager.get_server_config(host)?;
+        let acceptor = TlsAcceptor::from(server_config);
+        let client_tls = acceptor.accept(client_io).await.map_err(DohProxyError::Io)?;
+        return mitm_serve(client_tls, host.to_string(), port, connector).await;
+    }
+
     // Connect to real server with TLS+ECH
     let server_tls = connector.connect(host, port).await?;
 

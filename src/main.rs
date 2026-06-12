@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prefer_ipv6 = args.iter().any(|a| a == "--ipv6");
     let enable_doh = !args.iter().any(|a| a == "--no-doh");
     let gateway_mode = args.iter().any(|a| a == "--gateway");
+    let h2_mitm = args.iter().any(|a| a == "--h2-mitm");
 
     // Parse --doh <url> argument
     let doh_server = args
@@ -101,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         doh_server_ech,
         upstream_proxy,
         server_ip,
+        h2_mitm,
         ..Default::default()
     };
 

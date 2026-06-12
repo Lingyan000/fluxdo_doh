@@ -29,6 +29,12 @@ pub struct CertManager {
     ca_cert: Certificate,
     /// CA cert in DER format
     ca_cert_der: CertificateDer<'static>,
+    /// 复用的叶子证书密钥对（所有 MITM 域名共享；本地信任的证书，私钥不出本机，无安全问题）
+    leaf_key_pair: KeyPair,
+    /// 叶子密钥对的 DER 编码，预存避免每次签发重新序列化
+    leaf_key_der: Vec<u8>,
+    /// 是否在叶子证书 ALPN 中提供 h2（启用 h2 MITM 时为 true）
+    h2_mitm: bool,
     /// Cache of generated certificates
     cert_cache: RwLock<HashMap<String, Arc<ServerConfig>>>,
     /// Crypto provider for rustls
@@ -37,7 +43,7 @@ pub struct CertManager {
 
 impl CertManager {
     /// Create a new certificate manager with embedded CA
-    pub fn new() -> Result<Self> {
+    pub fn new(h2_mitm: bool) -> Result<Self> {
         info!("Loading embedded CA certificate");
 
         // Parse CA private key
@@ -55,12 +61,20 @@ impl CertManager {
 
         let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
 
+        // 生成一次复用的叶子证书密钥对，避免每个域名签发时重新生成密钥
+        let leaf_key_pair = KeyPair::generate()
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to generate leaf key: {}", e)))?;
+        let leaf_key_der = leaf_key_pair.serialize_der();
+
         info!("CA certificate loaded successfully");
 
         Ok(Self {
             ca_key_pair,
             ca_cert,
             ca_cert_der,
+            leaf_key_pair,
+            leaf_key_der,
+            h2_mitm,
             cert_cache: RwLock::new(HashMap::new()),
             crypto_provider,
         })
@@ -116,18 +130,14 @@ impl CertManager {
         // Not a CA
         params.is_ca = IsCa::NoCa;
 
-        // Generate key pair for this certificate
-        let key_pair = KeyPair::generate()
-            .map_err(|e| DohProxyError::Certificate(format!("Failed to generate key: {}", e)))?;
-
-        // Create the certificate signed by CA
+        // 复用预生成的叶子密钥对签发，省去每个域名一次密钥生成（在 TLS 握手关键路径上）
         let cert = params
-            .signed_by(&key_pair, &self.ca_cert, &self.ca_key_pair)
+            .signed_by(&self.leaf_key_pair, &self.ca_cert, &self.ca_key_pair)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to sign cert: {}", e)))?;
 
         // Convert to rustls types
         let cert_der = CertificateDer::from(cert.der().to_vec());
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(self.leaf_key_der.clone()));
 
         // Build server config with cert chain (leaf + CA)
         let mut config = ServerConfig::builder_with_provider(self.crypto_provider.clone())
@@ -137,14 +147,19 @@ impl CertManager {
             .with_single_cert(vec![cert_der, self.ca_cert_der.clone()], key_der)
             .map_err(|e| DohProxyError::Certificate(format!("Failed to build config: {}", e)))?;
 
-        // ALPN: 仅提供 http/1.1，MITM 做 raw byte copy 无法翻译 h2↔h1
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        // ALPN：h2 MITM 开启时提供 h2，让 client 可协商 HTTP/2 多路复用；
+        // 关闭时仅 http/1.1（裸字节拷贝无法翻译 h2↔h1）
+        config.alpn_protocols = if self.h2_mitm {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        };
 
         Ok(config)
     }
 
     /// 从运行时 PEM 创建 CertManager（用于 per-device CA）
-    pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
+    pub fn from_pem(cert_pem: &str, key_pem: &str, h2_mitm: bool) -> Result<Self> {
         info!("Loading runtime CA certificate from PEM");
 
         let ca_key_pair = KeyPair::from_pem(key_pem)
@@ -160,12 +175,20 @@ impl CertManager {
 
         let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
 
+        // 生成一次复用的叶子证书密钥对，避免每个域名签发时重新生成密钥
+        let leaf_key_pair = KeyPair::generate()
+            .map_err(|e| DohProxyError::Certificate(format!("Failed to generate leaf key: {}", e)))?;
+        let leaf_key_der = leaf_key_pair.serialize_der();
+
         info!("Runtime CA certificate loaded successfully");
 
         Ok(Self {
             ca_key_pair,
             ca_cert,
             ca_cert_der,
+            leaf_key_pair,
+            leaf_key_der,
+            h2_mitm,
             cert_cache: RwLock::new(HashMap::new()),
             crypto_provider,
         })
