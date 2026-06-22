@@ -48,16 +48,8 @@ impl UpstreamProxyConfig {
         }
 
         if self.is_shadowsocks() {
-            let cipher = self
-                .cipher
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default();
-            let password = self
-                .password
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or_default();
+            let cipher = self.cipher.as_deref().map(str::trim).unwrap_or_default();
+            let password = self.password.as_deref().map(str::trim).unwrap_or_default();
             if cipher.is_empty() || password.is_empty() {
                 return false;
             }

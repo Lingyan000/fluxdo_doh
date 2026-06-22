@@ -34,13 +34,21 @@ fn main() {
 
     let openssl_status = Command::new("openssl")
         .args([
-            "req", "-x509", "-newkey", "ec",
-            "-pkeyopt", "ec_paramgen_curve:prime256v1",
-            "-keyout", "certs/ca.key",
-            "-out", "certs/ca.crt",
-            "-days", "3650",
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:prime256v1",
+            "-keyout",
+            "certs/ca.key",
+            "-out",
+            "certs/ca.crt",
+            "-days",
+            "3650",
             "-nodes",
-            "-subj", "/CN=DOH Proxy CA/O=DOH Proxy/C=CN",
+            "-subj",
+            "/CN=DOH Proxy CA/O=DOH Proxy/C=CN",
         ])
         .status();
 
@@ -49,8 +57,13 @@ fn main() {
             // 生成 DER 格式
             let _ = Command::new("openssl")
                 .args([
-                    "x509", "-in", "certs/ca.crt",
-                    "-outform", "DER", "-out", "certs/ca.der",
+                    "x509",
+                    "-in",
+                    "certs/ca.crt",
+                    "-outform",
+                    "DER",
+                    "-out",
+                    "certs/ca.der",
                 ])
                 .status();
 

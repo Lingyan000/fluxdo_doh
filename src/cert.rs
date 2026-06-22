@@ -5,6 +5,7 @@
 //! - Dynamically generating certificates for target domains
 
 use crate::error::{DohProxyError, Result};
+use parking_lot::RwLock;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
@@ -13,7 +14,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 use tracing::{debug, info};
 
 /// Embedded CA certificate (PEM format)
@@ -62,8 +62,9 @@ impl CertManager {
         let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
 
         // 生成一次复用的叶子证书密钥对，避免每个域名签发时重新生成密钥
-        let leaf_key_pair = KeyPair::generate()
-            .map_err(|e| DohProxyError::Certificate(format!("Failed to generate leaf key: {}", e)))?;
+        let leaf_key_pair = KeyPair::generate().map_err(|e| {
+            DohProxyError::Certificate(format!("Failed to generate leaf key: {}", e))
+        })?;
         let leaf_key_der = leaf_key_pair.serialize_der();
 
         info!("CA certificate loaded successfully");
@@ -116,9 +117,10 @@ impl CertManager {
         params.distinguished_name = dn;
 
         // Set SAN (Subject Alternative Name)
-        params.subject_alt_names = vec![SanType::DnsName(hostname.try_into().map_err(|e| {
-            DohProxyError::Certificate(format!("Invalid hostname: {}", e))
-        })?)];
+        params.subject_alt_names =
+            vec![SanType::DnsName(hostname.try_into().map_err(|e| {
+                DohProxyError::Certificate(format!("Invalid hostname: {}", e))
+            })?)];
 
         // Set key usage for server certificate
         params.key_usages = vec![
@@ -176,8 +178,9 @@ impl CertManager {
         let crypto_provider = Arc::new(crate::tls_crypto::build_provider());
 
         // 生成一次复用的叶子证书密钥对，避免每个域名签发时重新生成密钥
-        let leaf_key_pair = KeyPair::generate()
-            .map_err(|e| DohProxyError::Certificate(format!("Failed to generate leaf key: {}", e)))?;
+        let leaf_key_pair = KeyPair::generate().map_err(|e| {
+            DohProxyError::Certificate(format!("Failed to generate leaf key: {}", e))
+        })?;
         let leaf_key_der = leaf_key_pair.serialize_der();
 
         info!("Runtime CA certificate loaded successfully");

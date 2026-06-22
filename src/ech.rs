@@ -3,7 +3,7 @@
 //! When the `ech` feature is enabled, this uses aws-lc-rs for HPKE support
 //! and enables true ECH encryption of the SNI field.
 
-use crate::dns::DnsResolver;
+use crate::dns::{DnsCacheRecord, DnsCacheStats, DnsResolver};
 use crate::error::{DohProxyError, Result};
 use crate::upstream::connect_tunnel;
 use crate::{BoxStream, UpstreamProxyConfig};
@@ -66,9 +66,27 @@ impl DohTlsConnector {
         }
     }
 
+    pub fn dns_cache_stats(&self) -> DnsCacheStats {
+        self.dns_resolver
+            .as_ref()
+            .map(|resolver| resolver.cache_stats())
+            .unwrap_or_default()
+    }
+
+    pub fn dns_cache_records(&self) -> Vec<DnsCacheRecord> {
+        self.dns_resolver
+            .as_ref()
+            .map(|resolver| resolver.cache_records())
+            .unwrap_or_default()
+    }
+
     /// Establish raw TCP tunnel to target host
     pub async fn connect_tcp(&self, host: &str, port: u16) -> Result<BoxStream> {
-        let stream = if let Some(proxy) = self.upstream_proxy.as_ref().filter(|proxy| proxy.is_valid()) {
+        let stream = if let Some(proxy) = self
+            .upstream_proxy
+            .as_ref()
+            .filter(|proxy| proxy.is_valid())
+        {
             tokio::time::timeout(self.timeout, connect_tunnel(proxy, host, port))
                 .await
                 .map_err(|_| DohProxyError::Timeout)??
@@ -102,17 +120,27 @@ impl DohTlsConnector {
         Arc::new(cfg)
     }
 
-    async fn connect_inner(&self, host: &str, port: u16, h2_alpn: bool) -> Result<TlsStream<BoxStream>> {
+    async fn connect_inner(
+        &self,
+        host: &str,
+        port: u16,
+        h2_alpn: bool,
+    ) -> Result<TlsStream<BoxStream>> {
         let start = std::time::Instant::now();
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|_| DohProxyError::InvalidUrl(format!("Invalid server name: {}", host)))?;
 
         if !self.enable_doh {
-            info!("DoH disabled for {}, using upstream/direct tunnel only", host);
-            let tls_config = self.get_or_build_tls_config(
-                #[cfg(feature = "ech")]
-                None,
-            ).await?;
+            info!(
+                "DoH disabled for {}, using upstream/direct tunnel only",
+                host
+            );
+            let tls_config = self
+                .get_or_build_tls_config(
+                    #[cfg(feature = "ech")]
+                    None,
+                )
+                .await?;
             let connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
             let tcp_stream = self.connect_tcp(host, port).await?;
             let tls_stream = self
@@ -138,7 +166,10 @@ impl DohTlsConnector {
             let ech_result = match dns_resolver.lookup_ech_config(host).await {
                 Ok(config) => config,
                 Err(e) => {
-                    warn!("ECH lookup failed for {}, proceeding without ECH: {}", host, e);
+                    warn!(
+                        "ECH lookup failed for {}, proceeding without ECH: {}",
+                        host, e
+                    );
                     None
                 }
             };
@@ -160,13 +191,20 @@ impl DohTlsConnector {
         }
 
         // Build TLS config (with or without ECH), 使用缓存以启用 TLS 会话恢复
-        let tls_config = self.get_or_build_tls_config(
-            #[cfg(feature = "ech")]
-            ech_config.as_ref(),
-        ).await?;
+        let tls_config = self
+            .get_or_build_tls_config(
+                #[cfg(feature = "ech")]
+                ech_config.as_ref(),
+            )
+            .await?;
         let connector = TlsConnector::from(Self::apply_alpn(tls_config, h2_alpn));
 
-        if self.upstream_proxy.as_ref().filter(|proxy| proxy.is_valid()).is_some() {
+        if self
+            .upstream_proxy
+            .as_ref()
+            .filter(|proxy| proxy.is_valid())
+            .is_some()
+        {
             let tcp_stream = self.connect_tcp(host, port).await?;
             let tls_stream = self
                 .finish_tls(&connector, server_name, tcp_stream, host, port)
@@ -183,18 +221,14 @@ impl DohTlsConnector {
         // 2. Prefer recently successful IP for this host (shared with query mode)
         if let Some(cached_addr) = dns_resolver.preferred_host_ip(host) {
             let socket_addr = SocketAddr::new(cached_addr, port);
-            debug!(
-                "Trying sticky IP for {}:{} via {}",
-                host, port, socket_addr
-            );
+            debug!("Trying sticky IP for {}:{} via {}", host, port, socket_addr);
             match self
                 .try_connect(&connector, socket_addr, host, server_name.clone())
                 .await
             {
                 Ok(stream) => {
                     dns_resolver.record_host_success(host, socket_addr.ip());
-                    dns_resolver
-                        .record_ip_rtt(socket_addr.ip(), start.elapsed());
+                    dns_resolver.record_ip_rtt(socket_addr.ip(), start.elapsed());
                     #[cfg(feature = "ech")]
                     {
                         let (_, conn) = stream.get_ref();
@@ -355,7 +389,10 @@ impl DohTlsConnector {
                     return Ok(Arc::new(config));
                 }
                 Err(e) => {
-                    warn!("Failed to parse ECH config, falling back to standard TLS: {}", e);
+                    warn!(
+                        "Failed to parse ECH config, falling back to standard TLS: {}",
+                        e
+                    );
                 }
             }
         }
@@ -444,10 +481,7 @@ impl DohTlsConnector {
         server_name: ServerName<'static>,
     ) -> Result<TlsStream<BoxStream>> {
         // TCP 连接阶段：5s 超时
-        let tcp_stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            TcpStream::connect(addr),
-        )
+        let tcp_stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
             .await
             .map_err(|_| DohProxyError::Timeout)?
             .map_err(DohProxyError::Io)?;
@@ -463,8 +497,8 @@ impl DohTlsConnector {
                 addr.port(),
             ),
         )
-            .await
-            .map_err(|_| DohProxyError::Timeout)?
+        .await
+        .map_err(|_| DohProxyError::Timeout)?
     }
 
     /// 交错并行连接多个地址，每个地址间 250ms 延迟启动，先成功者胜出
@@ -477,7 +511,10 @@ impl DohTlsConnector {
         addrs: Vec<std::net::IpAddr>,
     ) -> Result<(TlsStream<BoxStream>, SocketAddr, Duration)> {
         if addrs.is_empty() {
-            return Err(DohProxyError::Proxy(format!("No addresses for {}:{}", host, port)));
+            return Err(DohProxyError::Proxy(format!(
+                "No addresses for {}:{}",
+                host, port
+            )));
         }
 
         // 只有一个地址时直接连接
@@ -485,7 +522,9 @@ impl DohTlsConnector {
             let socket_addr = SocketAddr::new(addrs[0], port);
             debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
             let attempt_start = std::time::Instant::now();
-            let stream = self.try_connect(connector, socket_addr, host, server_name).await?;
+            let stream = self
+                .try_connect(connector, socket_addr, host, server_name)
+                .await?;
             return Ok((stream, socket_addr, attempt_start.elapsed()));
         }
 
@@ -508,10 +547,9 @@ impl DohTlsConnector {
                 debug!("Trying to connect to {}:{} via {}", host, port, socket_addr);
                 let start = std::time::Instant::now();
                 // TCP 连接：5s 超时
-                let tcp_result = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    TcpStream::connect(socket_addr),
-                ).await;
+                let tcp_result =
+                    tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(socket_addr))
+                        .await;
                 let tcp_stream = match tcp_result {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
@@ -529,7 +567,8 @@ impl DohTlsConnector {
                 let tls_result = tokio::time::timeout(
                     Duration::from_secs(10),
                     connector.connect(server_name, Box::new(tcp_stream) as BoxStream),
-                ).await;
+                )
+                .await;
                 match tls_result {
                     Ok(Ok(stream)) => {
                         let rtt = start.elapsed();
@@ -557,7 +596,10 @@ impl DohTlsConnector {
                 Ok((stream, socket_addr, rtt)) => {
                     debug!(
                         "Connected to {}:{} via {} in {} ms",
-                        host, port, socket_addr, attempt_start.elapsed().as_millis()
+                        host,
+                        port,
+                        socket_addr,
+                        attempt_start.elapsed().as_millis()
                     );
                     return Ok((stream, socket_addr, rtt));
                 }
@@ -583,10 +625,11 @@ impl DohTlsConnector {
         host: &str,
         port: u16,
     ) -> Result<TlsStream<BoxStream>> {
-        let tls_stream = tokio::time::timeout(self.timeout, connector.connect(server_name, tcp_stream))
-            .await
-            .map_err(|_| DohProxyError::Timeout)?
-            .map_err(|e| DohProxyError::Io(e))?;
+        let tls_stream =
+            tokio::time::timeout(self.timeout, connector.connect(server_name, tcp_stream))
+                .await
+                .map_err(|_| DohProxyError::Timeout)?
+                .map_err(|e| DohProxyError::Io(e))?;
 
         let (_, conn) = tls_stream.get_ref();
         debug!(

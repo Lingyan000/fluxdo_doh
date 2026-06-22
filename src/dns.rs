@@ -2,7 +2,7 @@
 
 use crate::error::{DohProxyError, Result};
 use crate::UpstreamProxyConfig;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use hickory_resolver::{
     config::{ResolverConfig, ResolverOpts},
@@ -15,7 +15,7 @@ use reqwest::Client;
 use rustls::pki_types::EchConfigListBytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::IpAddr,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -74,6 +74,34 @@ pub struct LookupHostResult {
     pub ech_config: Option<EchConfigListBytes<'static>>,
     pub preferred_ip: Option<IpAddr>,
     pub ttl: Duration,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct DnsCacheStats {
+    pub resolver_count: usize,
+    pub host_count: usize,
+    pub ip_count: usize,
+    pub ech_count: usize,
+    pub ech_negative_count: usize,
+    pub ip_rtt_count: usize,
+    pub preferred_ip_count: usize,
+}
+
+impl DnsCacheStats {
+    pub fn total_entries(&self) -> usize {
+        self.ip_count
+            + self.ech_count
+            + self.ech_negative_count
+            + self.ip_rtt_count
+            + self.preferred_ip_count
+    }
+}
+
+pub struct DnsCacheRecord {
+    pub host: String,
+    pub kind: &'static str,
+    pub values: Vec<String>,
+    pub ttl_ms: u64,
 }
 
 struct CachedEchConfig {
@@ -172,6 +200,33 @@ impl DnsResolver {
         }
     }
 
+    pub async fn shared_cache_stats() -> DnsCacheStats {
+        let guard = Self::shared_resolver_holder().read().await;
+        let mut stats = DnsCacheStats {
+            resolver_count: guard.len(),
+            ..Default::default()
+        };
+        for resolver in guard.values() {
+            let item = resolver.cache_stats();
+            stats.host_count += item.host_count;
+            stats.ip_count += item.ip_count;
+            stats.ech_count += item.ech_count;
+            stats.ech_negative_count += item.ech_negative_count;
+            stats.ip_rtt_count += item.ip_rtt_count;
+            stats.preferred_ip_count += item.preferred_ip_count;
+        }
+        stats
+    }
+
+    pub async fn shared_cache_records() -> Vec<DnsCacheRecord> {
+        let guard = Self::shared_resolver_holder().read().await;
+        let mut records = Vec::new();
+        for resolver in guard.values() {
+            records.extend(resolver.cache_records());
+        }
+        records
+    }
+
     /// Create a new DNS resolver using Cloudflare DOH
     pub async fn new_cloudflare(prefer_ipv6: bool) -> Result<Self> {
         Self::with_resolver_config(ResolverConfig::cloudflare_https(), prefer_ipv6).await
@@ -205,7 +260,8 @@ impl DnsResolver {
             if let Some(ech_url) = doh_url_ech {
                 let (_, doh_uri_ech) = Self::parse_doh_url(ech_url, prefer_ipv6).await?;
                 if let Some(ech_uri) = doh_uri_ech {
-                    let ech_client = Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?;
+                    let ech_client =
+                        Self::build_doh_client(resolver.resolve_timeout, upstream_proxy.as_ref())?;
                     resolver.doh_uri_ech = Some(ech_uri);
                     resolver.doh_client_ech = Some(ech_client);
                 } else {
@@ -363,9 +419,9 @@ impl DnsResolver {
         if let Ok(ip) = host.parse::<IpAddr>() {
             ips.push(ip);
         } else {
-            let addrs = lookup_host((host, port))
-                .await
-                .map_err(|e| DohProxyError::Dns(format!("Failed to resolve DOH host {}: {}", host, e)))?;
+            let addrs = lookup_host((host, port)).await.map_err(|e| {
+                DohProxyError::Dns(format!("Failed to resolve DOH host {}: {}", host, e))
+            })?;
             ips.extend(addrs.map(|addr| addr.ip()));
         }
 
@@ -418,7 +474,10 @@ impl DnsResolver {
     }
 
     /// Lookup ECH config for a domain via HTTPS DNS record
-    pub async fn lookup_ech_config(&self, domain: &str) -> Result<Option<EchConfigListBytes<'static>>> {
+    pub async fn lookup_ech_config(
+        &self,
+        domain: &str,
+    ) -> Result<Option<EchConfigListBytes<'static>>> {
         // 定期清理过期缓存
         self.maybe_cleanup_caches();
 
@@ -476,10 +535,8 @@ impl DnsResolver {
         // Query HTTPS record
         let lookup = match tokio::time::timeout(
             self.resolve_timeout,
-            self.resolver.lookup(
-                domain,
-                hickory_resolver::proto::rr::RecordType::HTTPS,
-            ),
+            self.resolver
+                .lookup(domain, hickory_resolver::proto::rr::RecordType::HTTPS),
         )
         .await
         {
@@ -514,7 +571,11 @@ impl DnsResolver {
         for record in lookup.iter() {
             if let Some(https) = record.as_https() {
                 if let Some(ech_config) = self.extract_ech_from_https(https) {
-                    info!("Found ECH config for {} ({} bytes)", domain, ech_config.len());
+                    info!(
+                        "Found ECH config for {} ({} bytes)",
+                        domain,
+                        ech_config.len()
+                    );
 
                     // Cache with DNS TTL
                     self.put_ech_cache(domain, ech_config.clone(), Duration::from_secs(ttl_secs));
@@ -557,12 +618,16 @@ impl DnsResolver {
                 }
                 SvcParamKey::Ipv4Hint => {
                     if let SvcParamValue::Ipv4Hint(ipv4_hint) = value {
-                        hints.ipv4_hints.extend(ipv4_hint.0.iter().map(|ip| IpAddr::V4(**ip)));
+                        hints
+                            .ipv4_hints
+                            .extend(ipv4_hint.0.iter().map(|ip| IpAddr::V4(**ip)));
                     }
                 }
                 SvcParamKey::Ipv6Hint => {
                     if let SvcParamValue::Ipv6Hint(ipv6_hint) = value {
-                        hints.ipv6_hints.extend(ipv6_hint.0.iter().map(|ip| IpAddr::V6(**ip)));
+                        hints
+                            .ipv6_hints
+                            .extend(ipv6_hint.0.iter().map(|ip| IpAddr::V6(**ip)));
                     }
                 }
                 _ => {}
@@ -668,7 +733,10 @@ impl DnsResolver {
                     }
                 },
                 Err(_) => {
-                    warn!("IP lookup timed out for {}, falling back to DoH GET", domain);
+                    warn!(
+                        "IP lookup timed out for {}, falling back to DoH GET",
+                        domain
+                    );
                     let result = self.lookup_ip_via_doh_get(domain).await;
                     let mut inflight = self.ip_inflight.lock().await;
                     inflight.remove(domain);
@@ -714,10 +782,8 @@ impl DnsResolver {
         &self,
         domain: &str,
     ) -> (Option<EchConfigListBytes<'static>>, Result<Vec<IpAddr>>) {
-        let (ech_result, ip_result) = tokio::join!(
-            self.lookup_ech_config(domain),
-            self.lookup_ip(domain),
-        );
+        let (ech_result, ip_result) =
+            tokio::join!(self.lookup_ech_config(domain), self.lookup_ip(domain),);
 
         let ech_config = match ech_result {
             Ok(config) => config,
@@ -798,6 +864,143 @@ impl DnsResolver {
         self.preferred_host_ip_cache.write().clear();
     }
 
+    pub fn cache_stats(&self) -> DnsCacheStats {
+        let now = std::time::Instant::now();
+        let mut hosts = HashSet::new();
+
+        let ip_count = {
+            let cache = self.ip_cache.read();
+            cache
+                .iter()
+                .filter(|(_, entry)| entry.expires_at > now)
+                .map(|(domain, _)| {
+                    hosts.insert(domain.clone());
+                })
+                .count()
+        };
+        let ech_count = {
+            let cache = self.ech_cache.read();
+            cache
+                .iter()
+                .filter(|(_, entry)| entry.expires_at > now)
+                .map(|(domain, _)| {
+                    hosts.insert(domain.clone());
+                })
+                .count()
+        };
+        let ech_negative_count = {
+            let cache = self.ech_negative_cache.read();
+            cache
+                .iter()
+                .filter(|(_, expires_at)| **expires_at > now)
+                .map(|(domain, _)| {
+                    hosts.insert(domain.clone());
+                })
+                .count()
+        };
+        let preferred_ip_count = {
+            let cache = self.preferred_host_ip_cache.read();
+            cache
+                .iter()
+                .filter(|(_, entry)| entry.expires_at > now)
+                .map(|(domain, _)| {
+                    hosts.insert(domain.clone());
+                })
+                .count()
+        };
+
+        DnsCacheStats {
+            resolver_count: 1,
+            host_count: hosts.len(),
+            ip_count,
+            ech_count,
+            ech_negative_count,
+            ip_rtt_count: self
+                .ip_rtt_cache
+                .read()
+                .values()
+                .filter(|entry| entry.expires_at > now)
+                .count(),
+            preferred_ip_count,
+        }
+    }
+
+    pub fn cache_records(&self) -> Vec<DnsCacheRecord> {
+        let now = std::time::Instant::now();
+        let mut records = Vec::new();
+
+        {
+            let cache = self.ip_cache.read();
+            for (host, entry) in cache.iter() {
+                if entry.expires_at <= now {
+                    continue;
+                }
+                records.push(DnsCacheRecord {
+                    host: host.clone(),
+                    kind: "ip",
+                    values: entry.addrs.iter().map(|addr| addr.to_string()).collect(),
+                    ttl_ms: Self::remaining_ttl_ms(entry.expires_at, now),
+                });
+            }
+        }
+
+        {
+            let cache = self.ech_cache.read();
+            for (host, entry) in cache.iter() {
+                if entry.expires_at <= now {
+                    continue;
+                }
+                records.push(DnsCacheRecord {
+                    host: host.clone(),
+                    kind: "ech",
+                    values: vec![STANDARD.encode(entry.config.as_ref())],
+                    ttl_ms: Self::remaining_ttl_ms(entry.expires_at, now),
+                });
+            }
+        }
+
+        {
+            let cache = self.ech_negative_cache.read();
+            for (host, expires_at) in cache.iter() {
+                if *expires_at <= now {
+                    continue;
+                }
+                records.push(DnsCacheRecord {
+                    host: host.clone(),
+                    kind: "ech_negative",
+                    values: Vec::new(),
+                    ttl_ms: Self::remaining_ttl_ms(*expires_at, now),
+                });
+            }
+        }
+
+        {
+            let cache = self.preferred_host_ip_cache.read();
+            for (host, entry) in cache.iter() {
+                if entry.expires_at <= now {
+                    continue;
+                }
+                records.push(DnsCacheRecord {
+                    host: host.clone(),
+                    kind: "preferred_ip",
+                    values: vec![entry.addr.to_string()],
+                    ttl_ms: Self::remaining_ttl_ms(entry.expires_at, now),
+                });
+            }
+        }
+
+        records.sort_by(|a, b| a.host.cmp(&b.host).then(a.kind.cmp(b.kind)));
+        records
+    }
+
+    fn remaining_ttl_ms(expires_at: std::time::Instant, now: std::time::Instant) -> u64 {
+        let ms = expires_at
+            .checked_duration_since(now)
+            .unwrap_or_default()
+            .as_millis();
+        ms.min(u64::MAX as u128) as u64
+    }
+
     pub fn preferred_host_ip(&self, domain: &str) -> Option<IpAddr> {
         let now = std::time::Instant::now();
         self.preferred_host_ip_cache
@@ -867,9 +1070,17 @@ impl DnsResolver {
                 .map(|entry| entry.rtt_ms)
                 .unwrap_or(u128::MAX);
             let family_bias = if self.prefer_ipv6 {
-                if addr.is_ipv6() { 0 } else { 1 }
+                if addr.is_ipv6() {
+                    0
+                } else {
+                    1
+                }
             } else {
-                if addr.is_ipv4() { 0 } else { 1 }
+                if addr.is_ipv4() {
+                    0
+                } else {
+                    1
+                }
             };
             (rtt, family_bias)
         });
@@ -936,7 +1147,10 @@ impl DnsResolver {
         // 仍然超限，淘汰最早过期的条目
         if cache.len() > MAX_CACHE_SIZE {
             let remove_count = cache.len() - MAX_CACHE_SIZE + MAX_CACHE_SIZE / 10;
-            let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.expires_at)).collect();
+            let mut entries: Vec<_> = cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.expires_at))
+                .collect();
             entries.sort_by_key(|(_, exp)| *exp);
             for (key, _) in entries.into_iter().take(remove_count) {
                 cache.remove(&key);
@@ -950,7 +1164,10 @@ impl DnsResolver {
         cache.retain(|_, v| v.expires_at > now);
         if cache.len() > MAX_CACHE_SIZE {
             let remove_count = cache.len() - MAX_CACHE_SIZE + MAX_CACHE_SIZE / 10;
-            let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), v.expires_at)).collect();
+            let mut entries: Vec<_> = cache
+                .iter()
+                .map(|(k, v)| (k.clone(), v.expires_at))
+                .collect();
             entries.sort_by_key(|(_, exp)| *exp);
             for (key, _) in entries.into_iter().take(remove_count) {
                 cache.remove(&key);
@@ -1006,15 +1223,21 @@ impl DnsResolver {
         upstream_proxy: Option<&UpstreamProxyConfig>,
     ) -> Result<Client> {
         let mut builder = Client::builder().timeout(timeout);
-        if let Some(proxy) = upstream_proxy.filter(|proxy| {
-            proxy.is_valid() && (proxy.is_http() || proxy.is_socks5())
-        }) {
+        if let Some(proxy) = upstream_proxy
+            .filter(|proxy| proxy.is_valid() && (proxy.is_http() || proxy.is_socks5()))
+        {
             let mut reqwest_proxy = reqwest::Proxy::all(proxy.reqwest_proxy_url())
                 .map_err(|e| DohProxyError::Proxy(format!("Invalid upstream proxy URL: {}", e)))?;
             if proxy.is_http() {
                 if let (Some(username), Some(password)) = (
-                proxy.username.as_deref().filter(|value| !value.trim().is_empty()),
-                proxy.password.as_deref().filter(|value| !value.trim().is_empty()),
+                    proxy
+                        .username
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty()),
+                    proxy
+                        .password
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty()),
                 ) {
                     reqwest_proxy = reqwest_proxy.basic_auth(username, password);
                 }

@@ -9,7 +9,8 @@ use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
 
 static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
-static SERVER: std::sync::OnceLock<Arc<RwLock<Option<Arc<DohProxyServer>>>>> = std::sync::OnceLock::new();
+static SERVER: std::sync::OnceLock<Arc<RwLock<Option<Arc<DohProxyServer>>>>> =
+    std::sync::OnceLock::new();
 static PORT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn get_runtime() -> &'static Runtime {
@@ -25,7 +26,10 @@ fn get_server_holder() -> &'static Arc<RwLock<Option<Arc<DohProxyServer>>>> {
     SERVER.get_or_init(|| Arc::new(RwLock::new(None)))
 }
 
-fn parse_required_string(ptr: *const c_char, field_name: &str) -> std::result::Result<String, String> {
+fn parse_required_string(
+    ptr: *const c_char,
+    field_name: &str,
+) -> std::result::Result<String, String> {
     if ptr.is_null() {
         return Err(format!("{} is null", field_name));
     }
@@ -130,7 +134,6 @@ pub extern "C" fn doh_proxy_start(port: c_int, prefer_ipv6: c_int) -> c_int {
 }
 
 fn start_server_with_config(config: ProxyConfig) -> c_int {
-
     let rt = get_runtime();
 
     // Create the server
@@ -237,7 +240,8 @@ pub extern "C" fn doh_proxy_lookup_ech_config(
 
     let rt = get_runtime();
     let result = rt.block_on(async {
-        let resolver = crate::dns::DnsResolver::shared(&doh_url, Some(&doh_url), false, None).await?;
+        let resolver =
+            crate::dns::DnsResolver::shared(&doh_url, Some(&doh_url), false, None).await?;
         resolver.lookup_ech_config(&host_str).await
     });
 
@@ -417,7 +421,12 @@ pub extern "C" fn doh_proxy_record_host_success(
     });
 
     if let Err(error) = result {
-        tracing::warn!("record_host_success failed for {} -> {}: {}", host_str, ip_str, error);
+        tracing::warn!(
+            "record_host_success failed for {} -> {}: {}",
+            host_str,
+            ip_str,
+            error
+        );
         0
     } else {
         1
@@ -477,6 +486,86 @@ pub extern "C" fn doh_proxy_clear_dns_cache() -> c_int {
         crate::dns::DnsResolver::clear_shared_caches().await;
     });
     1
+}
+
+/// Return shared DNS resolver cache statistics.
+/// The caller must free the returned string with doh_proxy_free_string.
+#[no_mangle]
+pub extern "C" fn doh_proxy_dns_cache_stats() -> *mut c_char {
+    doh_proxy_init_logging();
+
+    let rt = get_runtime();
+    let stats = rt.block_on(async {
+        let current_stats = {
+            let server_holder = get_server_holder();
+            let guard = server_holder.read().await;
+            guard.as_ref().map(|server| server.dns_cache_stats())
+        };
+        if let Some(stats) = current_stats {
+            stats
+        } else {
+            crate::dns::DnsResolver::shared_cache_stats().await
+        }
+    });
+    let json = serde_json::json!({
+        "ok": true,
+        "resolver_count": stats.resolver_count,
+        "host_count": stats.host_count,
+        "ip_count": stats.ip_count,
+        "ech_count": stats.ech_count,
+        "ech_negative_count": stats.ech_negative_count,
+        "ip_rtt_count": stats.ip_rtt_count,
+        "preferred_ip_count": stats.preferred_ip_count,
+        "total_entries": stats.total_entries(),
+    })
+    .to_string();
+
+    match std::ffi::CString::new(json) {
+        Ok(c) => c.into_raw(),
+        Err(_) => error_json("CString conversion failed"),
+    }
+}
+
+/// Return shared DNS resolver cache records.
+/// The caller must free the returned string with doh_proxy_free_string.
+#[no_mangle]
+pub extern "C" fn doh_proxy_dns_cache_records() -> *mut c_char {
+    doh_proxy_init_logging();
+
+    let rt = get_runtime();
+    let records = rt.block_on(async {
+        let current_records = {
+            let server_holder = get_server_holder();
+            let guard = server_holder.read().await;
+            guard.as_ref().map(|server| server.dns_cache_records())
+        };
+        if let Some(records) = current_records {
+            records
+        } else {
+            crate::dns::DnsResolver::shared_cache_records().await
+        }
+    });
+    let records_json: Vec<_> = records
+        .into_iter()
+        .map(|record| {
+            serde_json::json!({
+                "host": record.host,
+                "kind": record.kind,
+                "values": record.values,
+                "ttl_ms": record.ttl_ms,
+            })
+        })
+        .collect();
+    let json = serde_json::json!({
+        "ok": true,
+        "records": records_json,
+    })
+    .to_string();
+
+    match std::ffi::CString::new(json) {
+        Ok(c) => c.into_raw(),
+        Err(_) => error_json("CString conversion failed"),
+    }
 }
 
 /// Generate a new CA certificate key pair.

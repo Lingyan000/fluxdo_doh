@@ -157,7 +157,10 @@ pub async fn connect_http_tunnel(
             break;
         }
 
-        if trimmed.to_ascii_lowercase().starts_with("proxy-authenticate:") {
+        if trimmed
+            .to_ascii_lowercase()
+            .starts_with("proxy-authenticate:")
+        {
             proxy_authenticate = Some(trimmed.to_string());
         }
     }
@@ -210,7 +213,11 @@ pub async fn connect_socks5_tunnel(
 
     let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
     let has_auth = proxy.auth_pair().is_some();
-    let methods = if has_auth { vec![0x00, 0x02] } else { vec![0x00] };
+    let methods = if has_auth {
+        vec![0x00, 0x02]
+    } else {
+        vec![0x00]
+    };
 
     let mut hello = Vec::with_capacity(2 + methods.len());
     hello.push(0x05);
@@ -236,8 +243,7 @@ pub async fn connect_socks5_tunnel(
             })?;
             let username_bytes = username.as_bytes();
             let password_bytes = password.as_bytes();
-            if username_bytes.len() > u8::MAX as usize || password_bytes.len() > u8::MAX as usize
-            {
+            if username_bytes.len() > u8::MAX as usize || password_bytes.len() > u8::MAX as usize {
                 return Err(DohProxyError::Proxy(
                     "SOCKS5 username or password is too long".to_string(),
                 ));
@@ -351,13 +357,13 @@ pub async fn connect_shadowsocks_tunnel(
         ));
     }
 
-    let cipher_name = proxy.shadowsocks_cipher().ok_or_else(|| {
-        DohProxyError::Proxy("Missing Shadowsocks cipher".to_string())
-    })?;
+    let cipher_name = proxy
+        .shadowsocks_cipher()
+        .ok_or_else(|| DohProxyError::Proxy("Missing Shadowsocks cipher".to_string()))?;
     let cipher = parse_shadowsocks_cipher(cipher_name)?;
-    let password = proxy.shadowsocks_password().ok_or_else(|| {
-        DohProxyError::Proxy("Missing Shadowsocks password".to_string())
-    })?;
+    let password = proxy
+        .shadowsocks_password()
+        .ok_or_else(|| DohProxyError::Proxy("Missing Shadowsocks password".to_string()))?;
     let server_addr = build_server_addr(&proxy.host, proxy.port);
     let server_config = ServerConfig::new(server_addr, password.to_string(), cipher)
         .map_err(|error| DohProxyError::Proxy(format!("Invalid Shadowsocks config: {}", error)))?;

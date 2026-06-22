@@ -76,9 +76,7 @@ fn filter_kx_groups_chrome_style(
         .filter(|group| {
             !matches!(
                 group.name(),
-                NamedGroup::X25519MLKEM768
-                    | NamedGroup::secp256r1MLKEM768
-                    | NamedGroup::MLKEM768
+                NamedGroup::X25519MLKEM768 | NamedGroup::secp256r1MLKEM768 | NamedGroup::MLKEM768
             )
         })
         .collect()

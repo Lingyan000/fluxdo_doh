@@ -82,9 +82,9 @@ impl DohProxyServer {
         // gateway 模式下仍需要 cert_manager：WebView 通过 CONNECT 走 MITM
         let cert_manager = if config.enable_doh {
             let cm = if let (Some(cert), Some(key)) = (&config.ca_cert_pem, &config.ca_key_pem) {
-                CertManager::from_pem(cert, key, config.h2_mitm)?   // 运行时 CA（per-device）
+                CertManager::from_pem(cert, key, config.h2_mitm)? // 运行时 CA（per-device）
             } else {
-                CertManager::new(config.h2_mitm)?                  // 编译时 CA
+                CertManager::new(config.h2_mitm)? // 编译时 CA
             };
             Some(Arc::new(cm))
         } else {
@@ -109,6 +109,14 @@ impl DohProxyServer {
     /// Get the local port
     pub fn port(&self) -> Option<u16> {
         self.local_addr().map(|a| a.port())
+    }
+
+    pub fn dns_cache_stats(&self) -> crate::dns::DnsCacheStats {
+        self.doh_tls_connector.dns_cache_stats()
+    }
+
+    pub fn dns_cache_records(&self) -> Vec<crate::dns::DnsCacheRecord> {
+        self.doh_tls_connector.dns_cache_records()
     }
 
     /// Start the proxy server
@@ -211,7 +219,15 @@ async fn handle_connection(
             let cert_manager = cert_manager.ok_or_else(|| {
                 DohProxyError::Proxy("MITM mode requires certificate manager".to_string())
             })?;
-            handle_connect_mitm(reader, writer, &target, doh_tls_connector, cert_manager, h2_mitm).await
+            handle_connect_mitm(
+                reader,
+                writer,
+                &target,
+                doh_tls_connector,
+                cert_manager,
+                h2_mitm,
+            )
+            .await
         } else {
             handle_connect_tunnel(reader, writer, &target, doh_tls_connector).await
         }
@@ -245,7 +261,10 @@ async fn handle_connect_tunnel(
     let server_stream = match doh_tls_connector.connect_tcp(&host, port).await {
         Ok(stream) => stream,
         Err(e) => {
-            warn!("Failed to establish upstream tunnel for {}:{}: {}", host, port, e);
+            warn!(
+                "Failed to establish upstream tunnel for {}:{}: {}",
+                host, port, e
+            );
             let msg = format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{}\r\n", e);
             writer.write_all(msg.as_bytes()).await?;
             return Err(e);
@@ -258,9 +277,9 @@ async fn handle_connect_tunnel(
 
     let buffered = reader.buffer().to_vec();
     let read_half = reader.into_inner();
-    let client_stream = read_half.reunite(writer).map_err(|_| {
-        DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string())
-    })?;
+    let client_stream = read_half
+        .reunite(writer)
+        .map_err(|_| DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string()))?;
     let client_stream = PrefixedStream::new(client_stream, buffered);
 
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
@@ -314,9 +333,9 @@ async fn handle_connect_mitm(
 
         let buffered = reader.buffer().to_vec();
         let read_half = reader.into_inner();
-        let client_stream = read_half.reunite(writer).map_err(|_| {
-            DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string())
-        })?;
+        let client_stream = read_half
+            .reunite(writer)
+            .map_err(|_| DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string()))?;
         let client_stream = PrefixedStream::new(client_stream, buffered);
 
         let server_config = cert_manager.get_server_config(&host)?;
@@ -335,7 +354,10 @@ async fn handle_connect_mitm(
     let server_tls = match doh_tls_connector.connect(&host, port).await {
         Ok(stream) => stream,
         Err(e) => {
-            warn!("Failed to establish MITM upstream for {}:{}: {}", host, port, e);
+            warn!(
+                "Failed to establish MITM upstream for {}:{}: {}",
+                host, port, e
+            );
             let msg = format!("HTTP/1.1 502 Bad Gateway\r\n\r\n{}\r\n", e);
             writer.write_all(msg.as_bytes()).await?;
             return Err(e);
@@ -350,9 +372,9 @@ async fn handle_connect_mitm(
 
     let buffered = reader.buffer().to_vec();
     let read_half = reader.into_inner();
-    let client_stream = read_half.reunite(writer).map_err(|_| {
-        DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string())
-    })?;
+    let client_stream = read_half
+        .reunite(writer)
+        .map_err(|_| DohProxyError::Proxy("Failed to reunite TCP stream halves".to_string()))?;
     let client_stream = PrefixedStream::new(client_stream, buffered);
 
     let server_config = cert_manager.get_server_config(&host)?;
@@ -402,8 +424,7 @@ async fn handle_gateway_connection(
     h2_mitm: bool,
 ) -> Result<()> {
     let io = TokioIo::new(stream);
-    let pool: GatewayPool =
-        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let pool: GatewayPool = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     let service = service_fn(move |req: Request<Incoming>| {
         let connector = connector.clone();
@@ -434,7 +455,11 @@ type GatewayBody = BoxBody<Bytes, hyper::Error>;
 type GatewayResponse = std::result::Result<Response<GatewayBody>, Infallible>;
 
 /// 只缓存 HTTP/2 sender（可 clone 多路复用），HTTP/1.1 不缓存。
-type GatewayPool = Arc<tokio::sync::Mutex<std::collections::HashMap<String, hyper::client::conn::http2::SendRequest<Incoming>>>>;
+type GatewayPool = Arc<
+    tokio::sync::Mutex<
+        std::collections::HashMap<String, hyper::client::conn::http2::SendRequest<Incoming>>,
+    >,
+>;
 
 enum GatewaySender {
     H2(hyper::client::conn::http2::SendRequest<Incoming>),
@@ -502,7 +527,10 @@ async fn gateway_forward_request(
             Ok(s) => s,
             Err(e) => {
                 warn!("Gateway connect failed for {}: {}", host_key, e);
-                return Ok(gateway_error_response(502, &format!("Connect failed: {}", e)));
+                return Ok(gateway_error_response(
+                    502,
+                    &format!("Connect failed: {}", e),
+                ));
             }
         };
 
@@ -513,13 +541,11 @@ async fn gateway_forward_request(
 
         if is_h2 {
             debug!("Gateway: HTTP/2 connection to {}", host_key);
-            let (s, conn) = hyper::client::conn::http2::handshake(
-                hyper_util::rt::TokioExecutor::new(),
-                io,
-            )
-            .await
-            .map_err(|e| warn!("Gateway H2 handshake failed: {}", e))
-            .unwrap_or_else(|_| unreachable!());
+            let (s, conn) =
+                hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                    .await
+                    .map_err(|e| warn!("Gateway H2 handshake failed: {}", e))
+                    .unwrap_or_else(|_| unreachable!());
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
                     debug!("Gateway H2 conn closed: {}", e);
@@ -572,7 +598,10 @@ async fn gateway_forward_request(
             warn!("Gateway forward failed for {}: {}", host_key, e);
             // Remove broken connection from pool
             pool.lock().await.remove(&host_key);
-            Ok(gateway_error_response(502, &format!("Forward failed: {}", e)))
+            Ok(gateway_error_response(
+                502,
+                &format!("Forward failed: {}", e),
+            ))
         }
     }
 }
@@ -610,7 +639,11 @@ async fn gateway_handle_connect_tunnel(
     req: Request<Incoming>,
     connector: Arc<DohTlsConnector>,
 ) -> GatewayResponse {
-    let target = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
+    let target = req
+        .uri()
+        .authority()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let (host, port) = match gateway_parse_host(&target) {
         Some(hp) => hp,
         None => return Ok(gateway_error_response(400, "Invalid CONNECT target")),
@@ -636,7 +669,10 @@ async fn gateway_handle_connect_tunnel(
                         );
                     }
                     Err(e) => {
-                        warn!("Gateway tunnel connect failed {}:{}: {}", host_clone, port, e);
+                        warn!(
+                            "Gateway tunnel connect failed {}:{}: {}",
+                            host_clone, port, e
+                        );
                     }
                 }
             }
@@ -658,7 +694,11 @@ async fn gateway_handle_connect(
     cert_manager: Option<Arc<CertManager>>,
     h2_mitm: bool,
 ) -> GatewayResponse {
-    let target = req.uri().authority().map(|a| a.to_string()).unwrap_or_default();
+    let target = req
+        .uri()
+        .authority()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let (host, port) = match gateway_parse_host(&target) {
         Some(hp) => hp,
         None => return Ok(gateway_error_response(400, "Invalid CONNECT target")),
@@ -668,7 +708,12 @@ async fn gateway_handle_connect(
 
     let cert_manager = match cert_manager {
         Some(cm) => cm,
-        None => return Ok(gateway_error_response(502, "Certificate manager not available")),
+        None => {
+            return Ok(gateway_error_response(
+                502,
+                "Certificate manager not available",
+            ))
+        }
     };
 
     let connector_clone = connector.clone();
@@ -679,8 +724,15 @@ async fn gateway_handle_connect(
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let io = TokioIo::new(upgraded);
-                if let Err(e) =
-                    gateway_mitm_upgraded(io, &host_clone, port, connector_clone, cert_manager, h2_mitm).await
+                if let Err(e) = gateway_mitm_upgraded(
+                    io,
+                    &host_clone,
+                    port,
+                    connector_clone,
+                    cert_manager,
+                    h2_mitm,
+                )
+                .await
                 {
                     warn!("Gateway MITM error {}:{}: {}", host_clone, port, e);
                 }
@@ -712,7 +764,10 @@ where
     if h2_mitm {
         let server_config = cert_manager.get_server_config(host)?;
         let acceptor = TlsAcceptor::from(server_config);
-        let client_tls = acceptor.accept(client_io).await.map_err(DohProxyError::Io)?;
+        let client_tls = acceptor
+            .accept(client_io)
+            .await
+            .map_err(DohProxyError::Io)?;
         return mitm_serve(client_tls, host.to_string(), port, connector).await;
     }
 
@@ -722,7 +777,10 @@ where
     // TLS handshake with client (MITM)
     let server_config = cert_manager.get_server_config(host)?;
     let acceptor = TlsAcceptor::from(server_config);
-    let client_tls = acceptor.accept(client_io).await.map_err(DohProxyError::Io)?;
+    let client_tls = acceptor
+        .accept(client_io)
+        .await
+        .map_err(DohProxyError::Io)?;
 
     // Bidirectional copy
     let (mut cr, mut cw) = tokio::io::split(client_tls);
@@ -826,10 +884,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }

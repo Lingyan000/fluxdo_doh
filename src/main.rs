@@ -17,10 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line args (simple version)
     let args: Vec<String> = std::env::args().collect();
 
-    let port = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let port = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let prefer_ipv6 = args.iter().any(|a| a == "--ipv6");
     let enable_doh = !args.iter().any(|a| a == "--no-doh");
@@ -82,14 +79,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .cloned();
 
     let upstream_proxy = match (upstream_host, upstream_port) {
-        (Some(host), Some(port)) if !host.trim().is_empty() && port > 0 => Some(UpstreamProxyConfig {
-            protocol: upstream_protocol,
-            host,
-            port,
-            username: upstream_username,
-            password: upstream_password,
-            cipher: upstream_cipher,
-        }),
+        (Some(host), Some(port)) if !host.trim().is_empty() && port > 0 => {
+            Some(UpstreamProxyConfig {
+                protocol: upstream_protocol,
+                host,
+                port,
+                username: upstream_username,
+                password: upstream_password,
+                cipher: upstream_cipher,
+            })
+        }
         _ => None,
     };
 
